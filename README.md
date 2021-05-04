@@ -5,124 +5,121 @@ using Velocidex Query Language (VQL) queries.
 
 To learn more about Velociraptor, read the documentation on:
 
-   https://docs.velociraptor.velocidex.com
+   https://www.velocidex.com/docs/
 
 ## Quick start
 
-1. Download the binary from the release page.
+If you want to see what Velociraptor is all about simply:
 
-2. You need to generate a server config file. This will generate new
-   key material. Simply follow the prompts:
+1. Download the binary from the release page for your favorite platform (Windows/Linux/MacOS).
 
-```bash
-  $ velociraptor config generate -i
-```
-
-3. Start the server:
+2. Start the GUI
 
 ```bash
- $ velociraptor --config /etc/velociraptor.config.yaml frontend
+  $ velociraptor gui
 ```
 
-4. Point a browser at the GUI port that you set in the config
-   file. You should be able to log in with the password set earlier.
+This will bring up the GUI, Frontend and a local client. You can
+collect artifacts from the client (which is just running on your own
+machine) as normal.
 
-5. Launch the client on any system with the generated client config file.
+Once you are ready for a full deployment, check out the various deployment options at
+https://www.velocidex.com/docs/getting-started
 
-```bash
- $ velociraptor --config client.conf.yaml client
-```
+## Running Velociraptor via Docker
 
-6. You should be able to search for the client in the GUI, browse VFS,
-   download files etc.
+To run a Velociraptor server via Docker, follow the instructions here:
+https://github.com/weslambert/velociraptor-docker
 
-To deploy the windows executable:
+## Running Velociraptor locally
 
-1. Install the released MSI installer.
+Velociraptor is also useful as a local triage tool. You can create a self contained local collector using the GUI:
 
-2. Drop the client configuration into `C:\Program Files\Velociraptor\Velociraptor.config.yaml` using any system administration method (e.g. group policy, SCCM etc).
+1. Start the GUI as above (`velociraptor gui`).
 
-## Running Velociraptor locally.
+2. Select the `Server Artifacts` sidebar menu, then `Build Collector`.
 
-Velociraptor is also useful as a local triage tool. In particular you
-might find Velociraptor's artifacts especially useful for quickly
-capturing important information about a running system. You can
-collect artifacts by using the "artifacts collect" command:
+3. Select and configure the artifacts you want to collect, then select
+   the `Uploaded Files` tab and download your customized collector.
 
-```bash
-    $ velociraptor artifacts list
-    INFO:2018/08/20 22:28:56 Loaded 18 built in artifacts
-    INFO:2018/08/20 22:28:56 Loaded 18 artifacts from artifacts/definitions/
-    Linux.Applications.Chrome.Extensions
-    Linux.Applications.Chrome.Extensions.Upload
-    Linux.Applications.Docker.Info
-    Linux.Applications.Docker.Version
-    Linux.Debian.AptSources
-
-    $ velociraptor artifacts list -v Linux.Debian.AptSources
-    .... displays the artifacts
-
-    $ velociraptor artifacts collect Linux.Debian.AptSources
-    ... Collects all the named artifacts
-```
-
-Explore more of Velociraptor's options using the -h flag.
-
-## Building from source.
+## Building from source
 
 To build from source, make sure you have a recent Golang installed
-from https://golang.org/dl/:
+from https://golang.org/dl/ (Currently at least Go 1.14):
 
 ```bash
-    $ go get -u www.velocidex.com/golang/velociraptor
-    $ go get -u github.com/golang/dep/cmd/dep
-    $ cd $GO_PATH/go/src/www.velocidex.com/golang/velociraptor/
-
-    # This will download go dependencies.
-    $ dep ensure
+    $ git clone https://github.com/Velocidex/velociraptor.git
+    $ cd velociraptor
 
     # This will build the GUI elements. You will need to have node
-    # installed first. For example on Windows get it from
-    # https://nodejs.org/en/download/ . You also need to have JAVA
-    # installed from https://www.java.com because the js compiler
-    # needs it.
-    $ cd gui/static/
+    # installed first. For example get it from
+    # https://nodejs.org/en/download/.
+    $ cd gui/velociraptor/
     $ npm install
 
-    # If gulp is not on your path you need to run it using node:
-    # node node_modules\gulp\bin\gulp.js compile
-    $ gulp compile
-    $ cd -
+    # This will build the webpack bundle
+    $ make build
 
-    # This builds a release (i.e. it will embed the GUI files in the
-    # binary). If you dont care about the GUI a simple "make" will
-    # build a bare binary.
-    $ go run make.go -v dev
-    $ go run make.go -v windows
+    # To build a dev binary just run make.
+    # NOTE: Make sure ~/go/bin is on your path -
+    # this is required to find the Golang tools we need.
+    $ cd ../..
+    $ make
+
+    # To build production binaries
+    $ make linux
+    $ make windows
 ```
 
-If you want to rebuild the protobuf you will need to install protobuf
-compiler (This is only necessary when editing any `*.proto` file):
+## Getting the latest version
 
-```bash
-   $ wget https://github.com/protocolbuffers/protobuf/releases/download/v3.8.0/protoc-3.8.0-linux-x86_64.zip
-   $ unzip protoc-3.8.0-linux-x86_64.zip
-   $ sudo mv include/google/ /usr/local/include/
-   $ sudo mv bin/protoc /usr/local/bin/
-   $ go get -u github.com/golang/protobuf/protoc-gen-go/
-   $ go install github.com/golang/protobuf/protoc-gen-go/
-   $ go get -u github.com/grpc-ecosystem/grpc-gateway/protoc-gen-grpc-gateway
-   $ go install github.com/grpc-ecosystem/grpc-gateway/protoc-gen-grpc-gateway
-   $ ./make_proto.sh
-```
+We have a pretty frequent release schedule but if you see a new
+feature submitted that you are really interested in, we would love to
+have more testing prior to the official release.
 
+We have a CI pipeline managed by GitHub actions. You can see the
+pipeline by clicking the actions tab on our GitHub project. There are
+two workflows:
+
+1. Windows Test: this workflow builds a minimal version of the
+   Velociraptor binary (without the GUI) and runs all the tests on
+   it. We also test various windows support functions in this
+   pipeline. This pipeline builds on every push in each PR.
+
+2. Linux Build All Arches: This pipeline builds complete binaries for
+   many supported architectures. It only runs when the PR is merged
+   into the master branch. To download the latest binaries simply
+   select the latest run of this pipeline, scroll down the page to the
+   "Artifacts" section and download the *Binaries.zip* file (Note you
+   need to be logged into GitHub to see this).
+
+If you fork the project on GitHub, the pipelines will run on your own
+fork as well as long as you enable GitHub Actions on your fork. If you
+need to prepare a PR for a new feature or modify an existing feature
+you can use this to build your own binaries for testing on all
+architectures before send us the PR.
+
+## Supported platforms
+
+Velociraptor is written in Golang and so is available for all the
+platforms [supported by Go](https://github.com/golang/go/wiki/MinimumRequirements). This means that Windows XP and Windows server 2003 are **not** supported but anything after Windows 7/Vista is.
+
+We build our releases on Centos 6 (x64) for Linux and Sierra for MacOS
+so earlier platforms may not be supported by our release pipeline. If
+you need 32 bit builds you will need to build from source. You can do
+this easily by forking the project on GitHub, enabling GitHub Actions
+in your fork and editing the `Linux Build All Arches` pipeline.
 
 ## Getting help
 
 Questions and feedback are welcome at velociraptor-discuss@googlegroups.com
 
-File issues on https://gitlab.com/velocidex/velociraptor
+You can also chat with us directly on discord https://www.velocidex.com/discord
+
+File issues on https://github.com/Velocidex/velociraptor
 
 Read more about Velociraptor on our blog:
 
-https://docs.velociraptor.velocidex.com
+https://www.velocidex.com/blog/
+
+Hang out on Medium https://medium.com/velociraptor-ir

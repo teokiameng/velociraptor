@@ -1,3 +1,5 @@
+// +build server_vql
+
 /*
    Velociraptor - Hunting Evil
    Copyright (C) 2019 Velocidex Innovations.
@@ -52,7 +54,8 @@ package server
 import (
 	"context"
 
-	api_proto "www.velocidex.com/golang/velociraptor/api/proto"
+	"github.com/Velocidex/ordereddict"
+	"www.velocidex.com/golang/velociraptor/acls"
 	"www.velocidex.com/golang/velociraptor/constants"
 	"www.velocidex.com/golang/velociraptor/datastore"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
@@ -73,15 +76,21 @@ type SearchPlugin struct{}
 
 func (self SearchPlugin) Call(
 	ctx context.Context,
-	scope *vfilter.Scope,
-	args *vfilter.Dict) <-chan vfilter.Row {
+	scope vfilter.Scope,
+	args *ordereddict.Dict) <-chan vfilter.Row {
 	output_chan := make(chan vfilter.Row)
 
 	go func() {
 		defer close(output_chan)
 
+		err := vql_subsystem.CheckAccess(scope, acls.READ_RESULTS)
+		if err != nil {
+			scope.Log("uploads: %s", err)
+			return
+		}
+
 		arg := &SearchPluginArgs{}
-		err := vfilter.ExtractArgs(scope, args, arg)
+		err = vfilter.ExtractArgs(scope, args, arg)
 		if err != nil {
 			scope.Log("search: %v", err)
 			return
@@ -91,8 +100,7 @@ func (self SearchPlugin) Call(
 			arg.Limit = 10000
 		}
 
-		any_config_obj, _ := scope.Resolve("server_config")
-		config_obj, ok := any_config_obj.(*api_proto.Config)
+		config_obj, ok := vql_subsystem.GetServerConfig(scope)
 		if !ok {
 			scope.Log("Command can only run on the server")
 			return
@@ -105,16 +113,19 @@ func (self SearchPlugin) Call(
 
 		for _, item := range db.SearchClients(
 			config_obj, constants.CLIENT_INDEX_URN,
-			arg.Query, arg.Type, arg.Offset, arg.Limit) {
-
-			output_chan <- vfilter.NewDict().Set("Hit", item)
+			arg.Query, arg.Type, arg.Offset, arg.Limit, datastore.UNSORTED) {
+			select {
+			case <-ctx.Done():
+				return
+			case output_chan <- ordereddict.NewDict().Set("Hit", item):
+			}
 		}
 	}()
 
 	return output_chan
 }
 
-func (self SearchPlugin) Info(scope *vfilter.Scope,
+func (self SearchPlugin) Info(scope vfilter.Scope,
 	type_map *vfilter.TypeMap) *vfilter.PluginInfo {
 	return &vfilter.PluginInfo{
 		Name:    "search",

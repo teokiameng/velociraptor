@@ -21,6 +21,8 @@ import (
 	"context"
 	"os"
 
+	"github.com/Velocidex/ordereddict"
+	"www.velocidex.com/golang/velociraptor/acls"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
 )
@@ -28,13 +30,19 @@ import (
 type GetPidFunction struct{}
 
 func (self *GetPidFunction) Call(ctx context.Context,
-	scope *vfilter.Scope,
-	args *vfilter.Dict) vfilter.Any {
+	scope vfilter.Scope,
+	args *ordereddict.Dict) vfilter.Any {
+
+	err := vql_subsystem.CheckAccess(scope, acls.MACHINE_STATE)
+	if err != nil {
+		scope.Log("environ: %s", err)
+		return 0
+	}
 
 	return os.Getpid()
 }
 
-func (self GetPidFunction) Info(scope *vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
+func (self GetPidFunction) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
 		Name: "getpid",
 		Doc:  "Returns the current pid of the process.",

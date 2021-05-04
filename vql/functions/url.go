@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/Velocidex/ordereddict"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
 )
@@ -38,9 +39,9 @@ type UrlArgs struct {
 
 type UrlFunction struct{}
 
-func (self *UrlFunction) Call(ctx context.Context,
-	scope *vfilter.Scope,
-	args *vfilter.Dict) vfilter.Any {
+func (self UrlFunction) Call(ctx context.Context,
+	scope vfilter.Scope,
+	args *ordereddict.Dict) vfilter.Any {
 	arg := &UrlArgs{}
 	err := vfilter.ExtractArgs(scope, args, arg)
 	if err != nil {
@@ -75,12 +76,12 @@ func normalize_path(path string) string {
 		return ""
 	}
 
-	// When we encode the URL Go needs it to be preceeded with a /
+	// When we encode the URL Go needs it to be preceded with a /
 	// otherwise it gets it wrong.
 	return "/" + path
 }
 
-func (self UrlFunction) Info(scope *vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
+func (self UrlFunction) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
 		Name:    "url",
 		Doc:     "Construct a URL or parse one.",

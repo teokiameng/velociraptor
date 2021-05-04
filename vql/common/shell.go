@@ -26,7 +26,9 @@ import (
 	"sync"
 	"syscall"
 
-	api_proto "www.velocidex.com/golang/velociraptor/api/proto"
+	"github.com/Velocidex/ordereddict"
+	"www.velocidex.com/golang/velociraptor/acls"
+	"www.velocidex.com/golang/velociraptor/artifacts"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	vfilter "www.velocidex.com/golang/vfilter"
 )
@@ -41,31 +43,35 @@ type ShellResult struct {
 	Stdout     string
 	Stderr     string
 	ReturnCode int64
+	Complete   bool
 }
 
 type ShellPlugin struct{}
 
 func (self ShellPlugin) Call(
 	ctx context.Context,
-	scope *vfilter.Scope,
-	args *vfilter.Dict) <-chan vfilter.Row {
+	scope vfilter.Scope,
+	args *ordereddict.Dict) <-chan vfilter.Row {
 	output_chan := make(chan vfilter.Row)
 
 	go func() {
 		defer close(output_chan)
 
+		err := vql_subsystem.CheckAccess(scope, acls.EXECVE)
+		if err != nil {
+			scope.Log("shell: %v", err)
+			return
+		}
+
 		// Check the config if we are allowed to execve at all.
-		scope_config, pres := scope.Resolve("config")
-		if pres {
-			config_obj, ok := scope_config.(*api_proto.ClientConfig)
-			if ok && config_obj.PreventExecve {
-				scope.Log("shell: Not allowed to execve by configuration.")
-				return
-			}
+		config_obj, ok := artifacts.GetConfig(scope)
+		if ok && config_obj.PreventExecve {
+			scope.Log("shell: Not allowed to execve by configuration.")
+			return
 		}
 
 		arg := &ShellPluginArgs{}
-		err := vfilter.ExtractArgs(scope, args, arg)
+		err = vfilter.ExtractArgs(scope, args, arg)
 		if err != nil {
 			scope.Log("shell: %v", err)
 			return
@@ -84,7 +90,16 @@ func (self ShellPlugin) Call(
 			arg.Length = 10240
 		}
 
-		command := exec.CommandContext(ctx, arg.Argv[0], arg.Argv[1:]...)
+		// Kill subprocess when the scope is destroyed.
+		sub_ctx, cancel := context.WithCancel(ctx)
+		err = scope.AddDestructor(cancel)
+		if err != nil {
+			cancel()
+			scope.Log("shell: %v", err)
+			return
+		}
+
+		command := exec.CommandContext(sub_ctx, arg.Argv[0], arg.Argv[1:]...)
 		stdout_pipe, err := command.StdoutPipe()
 		if err != nil {
 			scope.Log("shell: no command to run")
@@ -100,9 +115,14 @@ func (self ShellPlugin) Call(
 		err = command.Start()
 		if err != nil {
 			scope.Log("shell: %v", err)
-			output_chan <- &ShellResult{
+			select {
+			case <-ctx.Done():
+				return
+
+			case output_chan <- &ShellResult{
 				ReturnCode: 1,
 				Stderr:     fmt.Sprintf("%v", err),
+			}:
 			}
 			return
 
@@ -112,12 +132,11 @@ func (self ShellPlugin) Call(
 		// to minimize the total number of responses.  Send a
 		// copy of the response because we will continue
 		// modifying it.
-		response := ShellResult{}
-		wg := sync.WaitGroup{}
+		wg := &sync.WaitGroup{}
 
 		read_from_pipe := func(
 			pipe io.ReadCloser,
-			output_member *string,
+			cb func(message string),
 			wg *sync.WaitGroup) {
 
 			defer wg.Done()
@@ -140,49 +159,111 @@ func (self ShellPlugin) Call(
 						return
 					}
 
+					// The buffer is completely empty and
+					// the last read was an EOF.
+					if n == 0 && offset == 0 && err == io.EOF {
+						return
+					}
+
 					// Read some data into the buffer.
 					if n > 0 {
 						offset += n
 						continue
 					}
 
-					// The buffer is completely empty and
-					// the last read was an EOF.
-					if n == 0 && offset == 0 && err == io.EOF {
-						return
-					}
 					if arg.Sep != "" {
 						for _, line := range strings.Split(
 							string(buff[:offset]), arg.Sep) {
-							if len(*output_member) > 0 {
-								output_chan <- response
+							if len(line) > 0 {
+								cb(line)
 							}
+						}
+						offset = 0
 
-							*output_member = line
+					} else if n == 0 {
+						line := string(buff[:offset])
+						if len(line) > 0 {
+							cb(line)
 						}
 
-					} else {
-						if len(*output_member) > 0 {
-							output_chan <- response
-						}
-
-						*output_member = string(buff[:offset])
+						// Write over the same buffer with new data.
+						offset = 0
 					}
 
-					// Write over the same buffer with new data.
-					offset = 0
 				}
 			}
 		}
 
 		// Read asyncronously.
-		wg.Add(1)
-		wg.Add(1)
-		go read_from_pipe(stdout_pipe, &response.Stdout, &wg)
-		go read_from_pipe(stderr_pipe, &response.Stderr, &wg)
+		var mu sync.Mutex
+		response := &ShellResult{}
+		length := int(arg.Length)
 
-		// We need to wait here until the readers are done.
+		wg.Add(1)
+		wg.Add(1)
+		go read_from_pipe(stdout_pipe, func(line string) {
+			mu.Lock()
+			defer mu.Unlock()
+
+			if arg.Sep != "" {
+				select {
+				case <-ctx.Done():
+					return
+
+				case output_chan <- &ShellResult{Stdout: line}:
+				}
+
+			} else {
+				data := response.Stdout + line
+				for len(data) > length {
+					response.Stdout = data[:length]
+					select {
+					case <-ctx.Done():
+						return
+
+					case output_chan <- &ShellResult{
+						Stdout: response.Stdout,
+					}:
+					}
+					data = data[length:]
+				}
+				response.Stdout = data
+			}
+		}, wg)
+		go read_from_pipe(stderr_pipe, func(line string) {
+			mu.Lock()
+			defer mu.Unlock()
+
+			if arg.Sep != "" {
+				select {
+				case <-ctx.Done():
+					return
+
+				case output_chan <- &ShellResult{Stdout: line}:
+				}
+			} else {
+				data := response.Stderr + line
+				for len(data) > length {
+					response.Stderr = data[:length]
+					select {
+					case <-ctx.Done():
+						return
+
+					case output_chan <- &ShellResult{
+						Stderr: response.Stderr,
+					}:
+					}
+					data = data[length:]
+				}
+				response.Stderr = data
+			}
+		}, wg)
+
+		// We need to wait here until the readers are done before calling command.Wait.
 		wg.Wait()
+
+		mu.Lock()
+		defer mu.Unlock()
 
 		// Get the command status and combine with the last response.
 		err = command.Wait()
@@ -200,14 +281,20 @@ func (self ShellPlugin) Call(
 				}
 			}
 		}
+		response.Complete = true
 
-		output_chan <- response
+		select {
+		case <-ctx.Done():
+			return
+
+		case output_chan <- response:
+		}
 	}()
 
 	return output_chan
 }
 
-func (self ShellPlugin) Info(scope *vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.PluginInfo {
+func (self ShellPlugin) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.PluginInfo {
 	return &vfilter.PluginInfo{
 		Name:    "execve",
 		Doc:     "Execute the commands given by argv.",

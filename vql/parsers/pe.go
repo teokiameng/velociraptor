@@ -19,11 +19,12 @@ package parsers
 
 import (
 	"context"
-	"io"
 
+	"github.com/Velocidex/ordereddict"
 	pe "www.velocidex.com/golang/go-pe"
-	"www.velocidex.com/golang/velociraptor/glob"
+	"www.velocidex.com/golang/velociraptor/constants"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
+	"www.velocidex.com/golang/velociraptor/vql/readers"
 	vfilter "www.velocidex.com/golang/vfilter"
 )
 
@@ -34,7 +35,7 @@ type _PEFunctionArgs struct {
 
 type _PEFunction struct{}
 
-func (self _PEFunction) Info(scope *vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
+func (self _PEFunction) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
 		Name:    "parse_pe",
 		Doc:     "Parse a PE file.",
@@ -43,8 +44,8 @@ func (self _PEFunction) Info(scope *vfilter.Scope, type_map *vfilter.TypeMap) *v
 }
 
 func (self _PEFunction) Call(
-	ctx context.Context, scope *vfilter.Scope,
-	args *vfilter.Dict) vfilter.Any {
+	ctx context.Context, scope vfilter.Scope,
+	args *ordereddict.Dict) vfilter.Any {
 	arg := &_PEFunctionArgs{}
 	err := vfilter.ExtractArgs(scope, args, arg)
 	if err != nil {
@@ -52,31 +53,41 @@ func (self _PEFunction) Call(
 		return &vfilter.Null{}
 	}
 
-	accessor, err := glob.GetAccessor(arg.Accessor, ctx)
+	err = vql_subsystem.CheckFilesystemAccess(scope, arg.Accessor)
 	if err != nil {
-		scope.Log("parse_pe: %v", err)
-		return &vfilter.Null{}
-	}
-	fd, err := accessor.Open(arg.Filename)
-	if err != nil {
-		scope.Log("parse_pe: %v", err)
-		return &vfilter.Null{}
-	}
-	defer fd.Close()
-
-	reader, ok := fd.(io.ReaderAt)
-	if !ok {
-		scope.Log("parse_pe: file is not seekable %s", arg.Filename)
+		scope.Log("parse_pe: %s", err)
 		return &vfilter.Null{}
 	}
 
-	pe_file, err := pe.NewPEFile(reader)
+	lru_size := vql_subsystem.GetIntFromRow(scope, scope, constants.BINARY_CACHE_SIZE)
+	paged_reader := readers.NewPagedReader(scope, arg.Accessor, arg.Filename, int(lru_size))
+	pe_file, err := pe.NewPEFile(paged_reader)
 	if err != nil {
-		scope.Log("parse_pe: %v", err)
+		scope.Log("parse_pe: %v for %v", err, arg.Filename)
 		return &vfilter.Null{}
 	}
 
-	return pe_file
+	// Return a lazy object.
+	return ordereddict.NewDict().
+		Set("FileHeader", pe_file.FileHeader).
+		Set("GUIDAge", pe_file.GUIDAge).
+		Set("PDB", pe_file.PDB).
+		Set("Sections", pe_file.Sections).
+		Set("VersionInformation", func() vfilter.Any {
+			return pe_file.VersionInformation()
+		}).
+		Set("Imports", func() vfilter.Any {
+			return pe_file.Imports()
+		}).
+		Set("Exports", func() vfilter.Any {
+			return pe_file.Exports()
+		}).
+		Set("Forwards", func() vfilter.Any {
+			return pe_file.Forwards()
+		}).
+		Set("ImpHash", func() vfilter.Any {
+			return pe_file.ImpHash()
+		})
 }
 
 func init() {

@@ -18,21 +18,17 @@
 package main
 
 import (
-	"fmt"
-	"io/ioutil"
+	"crypto/x509"
+	"encoding/pem"
 	"os"
-	"regexp"
-	"runtime"
 	"runtime/pprof"
 	"runtime/trace"
-	"strings"
-	"time"
 
-	"github.com/Velocidex/yaml"
+	"github.com/Velocidex/survey"
 	errors "github.com/pkg/errors"
 	kingpin "gopkg.in/alecthomas/kingpin.v2"
-	api_proto "www.velocidex.com/golang/velociraptor/api/proto"
 	"www.velocidex.com/golang/velociraptor/config"
+	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/logging"
 
 	// Import all vql plugins.
@@ -45,17 +41,23 @@ var (
 	app = kingpin.New("velociraptor",
 		"An advanced incident response and monitoring agent.")
 
-	config_path = app.Flag("config", "The configuration file.").Short('c').
-			Envar("VELOCIRAPTOR_CONFIG").String()
+	config_path = app.Flag("config", "The configuration file.").
+			Short('c').String()
+	api_config_path = app.Flag("api_config", "The API configuration file.").
+			Short('a').String()
 
-	api_config_path = app.Flag("api_config", "The API configuration file.").Short('a').
-			Envar("VELOCIRAPTOR_API_CONFIG").String()
+	override_flag = app.Flag("config_override", "A json object to override the config.").
+			Short('o').String()
+
+	run_as = app.Flag("runas", "Run as this username's ACLs").String()
 
 	artifact_definitions_dir = app.Flag(
 		"definitions", "A directory containing artifact definitions").String()
 
+	no_color_flag = app.Flag("nocolor", "Disable color output").Bool()
+
 	verbose_flag = app.Flag(
-		"verbose", "Enabled verbose logging for client.").Short('v').
+		"verbose", "Enabled verbose logging.").Short('v').
 		Default("false").Bool()
 
 	profile_flag = app.Flag(
@@ -64,104 +66,122 @@ var (
 	trace_flag = app.Flag(
 		"trace", "Write trace information to this file.").String()
 
+	trace_vql_flag = app.Flag("trace_vql", "Enable VQL tracing.").Bool()
+
+	logging_flag = app.Flag(
+		"logfile", "Write to this file as well").String()
+
+	tempdir_flag = app.Flag(
+		"tempdir", "Write all temp files to this directory").String()
+
 	command_handlers []CommandHandler
 )
 
-func validateServerConfig(configuration *api_proto.Config) error {
-	if configuration.Frontend.Certificate == "" {
-		return errors.New("Configuration does not specify a frontend certificate.")
+// Try to unlock encrypted API keys
+func maybe_unlock_api_config(config_obj *config_proto.Config) error {
+	if config_obj.ApiConfig == nil || config_obj.ApiConfig.ClientPrivateKey == "" {
+		return nil
 	}
 
-	for _, url := range configuration.Client.ServerUrls {
-		if !strings.HasSuffix(url, "/") {
-			return errors.New(
-				"Configuration Client.server_urls must end with /")
-		}
+	// If the key is locked ask for a password.
+	private_key := []byte(config_obj.ApiConfig.ClientPrivateKey)
+	block, _ := pem.Decode(private_key)
+	if block == nil {
+		return errors.New("Unable to decode private key.")
 	}
 
-	// On windows we require file locations to include a drive
-	// letter.
-	if runtime.GOOS == "windows" {
-		path_regex := regexp.MustCompile("^[a-zA-Z]:")
-		path_check := func(parameter, value string) error {
-			if !path_regex.MatchString(value) {
-				return errors.New(fmt.Sprintf(
-					"%s must have a drive letter.",
-					parameter))
-			}
-			if strings.Contains(value, "/") {
-				return errors.New(fmt.Sprintf(
-					"%s can not contain / path separators on windows.",
-					parameter))
-			}
-			return nil
-		}
-
-		err := path_check("Datastore.Locations",
-			configuration.Datastore.Location)
+	if x509.IsEncryptedPEMBlock(block) {
+		password := ""
+		err := survey.AskOne(
+			&survey.Password{Message: "Password:"},
+			&password,
+			survey.WithValidator(survey.Required))
 		if err != nil {
 			return err
 		}
-		err = path_check("Datastore.Locations",
-			configuration.Datastore.FilestoreDirectory)
+
+		decrypted_block, err := x509.DecryptPEMBlock(
+			block, []byte(password))
 		if err != nil {
 			return err
 		}
+		config_obj.ApiConfig.ClientPrivateKey = string(
+			pem.EncodeToMemory(&pem.Block{
+				Bytes: decrypted_block,
+				Type:  block.Type,
+			}))
 	}
-
 	return nil
 }
 
-func get_server_config(config_path string) (*api_proto.Config, error) {
-	config_obj, err := config.LoadConfig(config_path)
-	if err != nil {
-		return nil, err
-	}
-	if err == nil {
-		err = validateServerConfig(config_obj)
-	}
-
-	return config_obj, err
-}
-
-func maybe_parse_api_config(config_obj *api_proto.Config) {
-	if *api_config_path != "" {
-		fd, err := os.Open(*api_config_path)
-		kingpin.FatalIfError(err, "Unable to read api config.")
-
-		data, err := ioutil.ReadAll(fd)
-		kingpin.FatalIfError(err, "Unable to read api config.")
-		err = yaml.Unmarshal(data, &config_obj.ApiConfig)
-		kingpin.FatalIfError(err, "Unable to decode config.")
-	}
-}
-
-func get_config_or_default() *api_proto.Config {
-	config_obj, err := config.LoadConfig(*config_path)
-	if err != nil {
-		config_obj = config.GetDefaultConfig()
-	}
-	maybe_parse_api_config(config_obj)
-	return config_obj
-}
+var (
+	DefaultConfigLoader, APIConfigLoader *config.Loader
+)
 
 func main() {
 	app.HelpFlag.Short('h')
-	app.UsageTemplate(kingpin.CompactUsageTemplate).DefaultEnvars()
-	command := kingpin.MustParse(app.Parse(os.Args[1:]))
+	app.UsageTemplate(kingpin.CompactUsageTemplate)
+	args := os.Args[1:]
 
-	// Just display everything in UTC.
-	os.Setenv("TZ", "Z")
-	time.Local = time.UTC
-
-	if !*verbose_flag {
-		logging.SuppressLogging = true
+	// If no args are given check if there is an embedded config
+	// with autoexec.
+	if len(args) == 0 {
+		config_obj, err := new(config.Loader).WithVerbose(*verbose_flag).
+			WithEmbedded().LoadAndValidate()
+		if err == nil && config_obj.Autoexec != nil && config_obj.Autoexec.Argv != nil {
+			for _, arg := range config_obj.Autoexec.Argv {
+				args = append(args, os.ExpandEnv(arg))
+			}
+			logging.Prelog("Autoexec with parameters: %v", args)
+		}
 	}
+
+	// Automatically add config flags
+	default_config, err := parseFlagsToDefaultConfig(app)
+	kingpin.FatalIfError(err, "Adding config flags.")
+
+	command := kingpin.MustParse(app.Parse(args))
+
+	if *no_color_flag {
+		logging.NoColor = true
+	}
+
+	doBanner()
+	defer doPrompt()
+
+	// Most commands load a config in the following order
+	DefaultConfigLoader = new(config.Loader).WithVerbose(*verbose_flag).
+		WithTempdir(*tempdir_flag).
+		WithFileLoader(*config_path).
+		WithEmbedded().
+		WithEnvLoader("VELOCIRAPTOR_CONFIG").
+		WithCustomValidator(initFilestoreAccessor).
+		WithCustomValidator(initDebugServer).
+		WithLogFile(*logging_flag).
+		WithOverride(*override_flag).
+		WithCustomValidator(func(config_obj *config_proto.Config) error {
+			return mergeFlagConfig(config_obj, default_config)
+		})
+
+	// Commands that potentially take an API config can load both
+	// - first try the API config, then try a config.
+	APIConfigLoader = new(config.Loader).WithVerbose(*verbose_flag).
+		WithTempdir(*tempdir_flag).
+		WithApiLoader(*api_config_path).
+		WithEnvApiLoader("VELOCIRAPTOR_API_CONFIG").
+		WithCustomValidator(maybe_unlock_api_config).
+		WithFileLoader(*config_path).
+		WithEmbedded().
+		WithEnvLoader("VELOCIRAPTOR_CONFIG").
+		WithCustomValidator(initFilestoreAccessor).
+		WithCustomValidator(initDebugServer).
+		WithLogFile(*logging_flag)
 
 	if *trace_flag != "" {
 		f, err := os.Create(*trace_flag)
 		kingpin.FatalIfError(err, "trace file.")
-		trace.Start(f)
+		err = trace.Start(f)
+		kingpin.FatalIfError(err, "trace file.")
 		defer trace.Stop()
 	}
 
@@ -169,7 +189,8 @@ func main() {
 		f2, err := os.Create(*profile_flag)
 		kingpin.FatalIfError(err, "Profile file.")
 
-		pprof.StartCPUProfile(f2)
+		err = pprof.StartCPUProfile(f2)
+		kingpin.FatalIfError(err, "Profile file.")
 		defer pprof.StopCPUProfile()
 
 	}

@@ -18,12 +18,16 @@
 package csv
 
 import (
+	"bytes"
+	"context"
+	"errors"
 	"io"
-	"os"
+	"reflect"
 	"sync"
 	"time"
 
-	"www.velocidex.com/golang/velociraptor/file_store"
+	"github.com/Velocidex/ordereddict"
+	"www.velocidex.com/golang/velociraptor/file_store/api"
 	"www.velocidex.com/golang/vfilter"
 )
 
@@ -41,9 +45,9 @@ func (self *CSVWriter) Close() {
 	self.wg.Wait()
 }
 
-type CSVReader chan *vfilter.Dict
+type CSVReader chan *ordereddict.Dict
 
-func GetCSVReader(fd file_store.ReadSeekCloser) CSVReader {
+func GetCSVReader(ctx context.Context, fd api.FileReader) CSVReader {
 	output_chan := make(CSVReader)
 
 	go func() {
@@ -57,7 +61,7 @@ func GetCSVReader(fd file_store.ReadSeekCloser) CSVReader {
 
 	process_file:
 		for {
-			row := vfilter.NewDict()
+			row := ordereddict.NewDict()
 			row_data, err := csv_reader.ReadAny()
 			if err != nil {
 				break process_file
@@ -70,7 +74,11 @@ func GetCSVReader(fd file_store.ReadSeekCloser) CSVReader {
 				row.Set(headers[idx], row_item)
 			}
 
-			output_chan <- row
+			select {
+			case <-ctx.Done():
+				return
+			case output_chan <- row:
+			}
 		}
 	}()
 
@@ -78,7 +86,7 @@ func GetCSVReader(fd file_store.ReadSeekCloser) CSVReader {
 
 }
 
-func GetCSVAppender(scope *vfilter.Scope, fd io.Writer, write_headers bool) (*CSVWriter, error) {
+func GetCSVAppender(scope vfilter.Scope, fd io.Writer, write_headers bool) *CSVWriter {
 	result := &CSVWriter{
 		row_chan: make(chan vfilter.Row),
 		wg:       sync.WaitGroup{},
@@ -112,7 +120,10 @@ func GetCSVAppender(scope *vfilter.Scope, fd io.Writer, write_headers bool) (*CS
 				}
 
 				if !headers_written {
-					w.Write(columns)
+					err := w.Write(columns)
+					if err != nil {
+						return
+					}
 					headers_written = true
 				}
 
@@ -126,7 +137,10 @@ func GetCSVAppender(scope *vfilter.Scope, fd io.Writer, write_headers bool) (*CS
 					item, _ := scope.Associative(row, column)
 					csv_row = append(csv_row, item)
 				}
-				w.WriteAny(csv_row)
+				err := w.WriteAny(csv_row)
+				if err != nil {
+					return
+				}
 
 			case <-time.After(5 * time.Second):
 				w.Flush()
@@ -136,14 +150,35 @@ func GetCSVAppender(scope *vfilter.Scope, fd io.Writer, write_headers bool) (*CS
 
 	}()
 
-	return result, nil
+	return result
 }
 
-func GetCSVWriter(scope *vfilter.Scope, fd file_store.WriteSeekCloser) (*CSVWriter, error) {
+func GetCSVWriter(scope vfilter.Scope, fd api.FileWriter) (*CSVWriter, error) {
 	// Seek to the end of the file.
-	length, err := fd.Seek(0, os.SEEK_END)
+	length, err := fd.Size()
 	if err != nil {
 		return nil, err
 	}
-	return GetCSVAppender(scope, fd, length == 0)
+	return GetCSVAppender(scope, fd, length == 0), nil
+}
+
+func EncodeToCSV(scope vfilter.Scope, v interface{}) (string, error) {
+	slice := reflect.ValueOf(v)
+	if slice.Type().Kind() != reflect.Slice {
+		return "", errors.New("EncodeToCSV - should be a list of rows")
+	}
+
+	buffer := &bytes.Buffer{}
+	writer := GetCSVAppender(scope, buffer, true)
+
+	for i := 0; i < slice.Len(); i++ {
+		value := slice.Index(i).Interface()
+		if value == nil {
+			continue
+		}
+		writer.Write(value)
+	}
+	writer.Close()
+
+	return buffer.String(), nil
 }

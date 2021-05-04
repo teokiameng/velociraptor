@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"reflect"
 
+	"github.com/Velocidex/ordereddict"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
 )
@@ -34,8 +35,8 @@ type FormatArgs struct {
 type FormatFunction struct{}
 
 func (self *FormatFunction) Call(ctx context.Context,
-	scope *vfilter.Scope,
-	args *vfilter.Dict) vfilter.Any {
+	scope vfilter.Scope,
+	args *ordereddict.Dict) vfilter.Any {
 	arg := &FormatArgs{}
 	err := vfilter.ExtractArgs(scope, args, arg)
 	if err != nil {
@@ -44,22 +45,24 @@ func (self *FormatFunction) Call(ctx context.Context,
 	}
 
 	var format_args []interface{}
-	slice := reflect.ValueOf(arg.Args)
 
-	// A slice of strings.
-	if slice.Type().Kind() != reflect.Slice {
-		format_args = append(format_args, arg.Args)
-	} else {
-		for i := 0; i < slice.Len(); i++ {
-			value := slice.Index(i).Interface()
-			format_args = append(format_args, value)
+	if arg.Args != nil {
+		slice := reflect.ValueOf(arg.Args)
+
+		// A slice of strings.
+		if slice.Type().Kind() != reflect.Slice {
+			format_args = append(format_args, arg.Args)
+		} else {
+			for i := 0; i < slice.Len(); i++ {
+				value := slice.Index(i).Interface()
+				format_args = append(format_args, value)
+			}
 		}
 	}
-
 	return fmt.Sprintf(arg.Format, format_args...)
 }
 
-func (self FormatFunction) Info(scope *vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
+func (self FormatFunction) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
 		Name:    "format",
 		Doc:     "Format one or more items according to a format string.",

@@ -21,14 +21,24 @@
 package glob
 
 import (
-	"context"
-	"encoding/json"
 	"io/ioutil"
 	"os"
 	"path/filepath"
 	"regexp"
 	"syscall"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"www.velocidex.com/golang/velociraptor/json"
+	"www.velocidex.com/golang/vfilter"
+)
+
+var (
+	fileAccessorCurrentOpened = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "accessor_file_current_open",
+		Help: "Number of currently opened files with the file accessor.",
+	})
 )
 
 type OSFileInfo struct {
@@ -40,25 +50,28 @@ func (self *OSFileInfo) FullPath() string {
 	return self._full_path
 }
 
-func (self *OSFileInfo) Mtime() TimeVal {
-	return TimeVal{
-		Sec:  int64(self.sys().Mtimespec.Sec),
-		Nsec: int64(self.sys().Mtimespec.Nsec),
-	}
+func (self *OSFileInfo) Btime() time.Time {
+	ts := self.sys().Birthtimespec
+	return time.Unix(0, ts.Nsec+ts.Sec*1000000000)
 }
 
-func (self *OSFileInfo) Ctime() TimeVal {
-	return TimeVal{
-		Sec:  int64(self.sys().Ctimespec.Sec),
-		Nsec: int64(self.sys().Ctimespec.Nsec),
-	}
+func (self *OSFileInfo) Mtime() time.Time {
+	ts := self.sys().Mtimespec
+	return time.Unix(0, ts.Nsec+ts.Sec*1000000000)
 }
 
-func (self *OSFileInfo) Atime() TimeVal {
-	return TimeVal{
-		Sec:  int64(self.sys().Atimespec.Sec),
-		Nsec: int64(self.sys().Atimespec.Nsec),
-	}
+func (self *OSFileInfo) Ctime() time.Time {
+	ts := self.sys().Ctimespec
+	return time.Unix(0, ts.Nsec+ts.Sec*1000000000)
+}
+
+func (self *OSFileInfo) Atime() time.Time {
+	ts := self.sys().Atimespec
+	return time.Unix(0, ts.Nsec+ts.Sec*1000000000)
+}
+
+func (self *OSFileInfo) _Sys() *syscall.Stat_t {
+	return self.sys()
 }
 
 func (self *OSFileInfo) Data() interface{} {
@@ -89,9 +102,9 @@ func (self *OSFileInfo) MarshalJSON() ([]byte, error) {
 		ModeStr  string
 		ModTime  time.Time
 		Sys      interface{}
-		Mtime    TimeVal
-		Ctime    TimeVal
-		Atime    TimeVal
+		Mtime    time.Time
+		Ctime    time.Time
+		Atime    time.Time
 	}{
 		FullPath: self.FullPath(),
 		Size:     self.Size(),
@@ -112,31 +125,15 @@ func (u *OSFileInfo) UnmarshalJSON(data []byte) error {
 }
 
 // Real implementation for non windows OSs:
-type OSFileSystemAccessor struct {
-	fd_cache map[string]*os.File
-}
+type OSFileSystemAccessor struct{}
 
-func (self OSFileSystemAccessor) New(ctx context.Context) FileSystemAccessor {
-	result := &OSFileSystemAccessor{
-		fd_cache: make(map[string]*os.File),
-	}
-
-	// When the context is done, close all the files. The files
-	// must remain open until the entire VQL query is done.
-	go func() {
-		select {
-		case <-ctx.Done():
-			for _, v := range result.fd_cache {
-				v.Close()
-			}
-		}
-	}()
-
-	return result
+func (self OSFileSystemAccessor) New(scope vfilter.Scope) (FileSystemAccessor, error) {
+	result := &OSFileSystemAccessor{}
+	return result, nil
 }
 
 func (self OSFileSystemAccessor) Lstat(filename string) (FileInfo, error) {
-	lstat, err := os.Lstat(filename)
+	lstat, err := os.Lstat(GetPath(filename))
 	if err != nil {
 		return nil, err
 	}
@@ -145,7 +142,7 @@ func (self OSFileSystemAccessor) Lstat(filename string) (FileInfo, error) {
 }
 
 func (self OSFileSystemAccessor) ReadDir(path string) ([]FileInfo, error) {
-	files, err := ioutil.ReadDir(path)
+	files, err := ioutil.ReadDir(GetPath(path))
 	if err == nil {
 		var result []FileInfo
 		for _, f := range files {
@@ -158,8 +155,12 @@ func (self OSFileSystemAccessor) ReadDir(path string) ([]FileInfo, error) {
 }
 
 func (self OSFileSystemAccessor) Open(path string) (ReadSeekCloser, error) {
-	file, err := os.Open(path)
+	file, err := os.Open(GetPath(path))
 	return file, err
+}
+
+func GetPath(path string) string {
+	return filepath.Clean("/" + path)
 }
 
 var OSFileSystemAccessor_re = regexp.MustCompile("/")
@@ -178,4 +179,5 @@ func (self OSFileSystemAccessor) GetRoot(path string) (string, string, error) {
 
 func init() {
 	Register("file", &OSFileSystemAccessor{})
+	Register("auto", &OSFileSystemAccessor{})
 }

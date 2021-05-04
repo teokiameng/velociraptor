@@ -1,29 +1,23 @@
 package reporting
 
 import (
-	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 
-	api_proto "www.velocidex.com/golang/velociraptor/api/proto"
-	"www.velocidex.com/golang/velociraptor/artifacts"
+	"github.com/Velocidex/ordereddict"
 	artifacts_proto "www.velocidex.com/golang/velociraptor/artifacts/proto"
+	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/logging"
+	"www.velocidex.com/golang/velociraptor/services"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
-)
-
-var (
-	valid_report_types = []string{
-		"MONITORING_DAILY", "CLIENT",
-		"CLIENT_EVENT", "SERVER_EVENT", "HUNT",
-	}
 )
 
 // An expander is presented to the go templates to implement template
 // operations.
 type TemplateEngine interface {
-	Execute(template_string string) (string, error)
+	Execute(report *artifacts_proto.Report) (string, error)
 	SetEnv(key string, value interface{})
 	GetArtifact() *artifacts_proto.Artifact
 	Close()
@@ -31,10 +25,12 @@ type TemplateEngine interface {
 
 // Everything needed to evaluate a template
 type BaseTemplateEngine struct {
-	Artifact *artifacts_proto.Artifact
-	Env      *vfilter.Dict
-	Scope    *vfilter.Scope
-	logger   *logging.LogContext
+	Artifact   *artifacts_proto.Artifact
+	Env        *ordereddict.Dict
+	Repository services.Repository
+	Scope      vfilter.Scope
+	logger     *logging.LogContext
+	config_obj *config_proto.Config
 }
 
 func (self *BaseTemplateEngine) GetArtifact() *artifacts_proto.Artifact {
@@ -49,13 +45,20 @@ func (self *BaseTemplateEngine) Close() {
 	self.Scope.Close()
 }
 
-func (self *BaseTemplateEngine) getFunction(a interface{}, b string) interface{} {
+func (self *BaseTemplateEngine) getFunction(a interface{}, b string,
+	opts ...interface{}) interface{} {
+
 	res := a
 	var pres bool
 	for _, component := range strings.Split(b, ".") {
 		res, pres = self.Scope.Associative(res, component)
 		if !pres {
-			return ""
+			var defaultValue interface{} = ""
+			if len(opts) > 0 {
+				defaultValue = opts[0]
+			}
+
+			return defaultValue
 		}
 	}
 	return res
@@ -68,6 +71,42 @@ func (self *BaseTemplateEngine) GetScope(item string) interface{} {
 	}
 
 	return "<?>"
+}
+
+func (self *BaseTemplateEngine) Expand(values ...interface{}) interface{} {
+	_, argv := parseOptions(values)
+	// Not enough args.
+	if len(argv) != 1 {
+		return ""
+	}
+
+	results := []interface{}{}
+
+	switch t := argv[0].(type) {
+	default:
+		return t
+
+	case []*NotebookCellQuery:
+		if len(t) == 0 { // No rows returned.
+			self.Scope.Log("Query produced no rows.")
+			return results
+		}
+
+		for _, item := range t {
+			results = append(results, item)
+		}
+
+	case []*ordereddict.Dict:
+		if len(t) == 0 { // No rows returned.
+			self.Scope.Log("Query produced no rows.")
+			return results
+		}
+		for _, item := range t {
+			results = append(results, item)
+		}
+	}
+
+	return results
 }
 
 // GenerateMonitoringDailyReport Generates a report for daily
@@ -100,7 +139,7 @@ func GenerateMonitoringDailyReport(template_engine TemplateEngine,
 			"client_event",
 			"monitoring_daily",
 		}) {
-		value, err := template_engine.Execute(report.Template)
+		value, err := template_engine.Execute(report)
 		if err != nil {
 			return "", err
 		}
@@ -112,23 +151,30 @@ func GenerateMonitoringDailyReport(template_engine TemplateEngine,
 
 func GenerateArtifactDescriptionReport(
 	template_engine TemplateEngine,
-	config_obj *api_proto.Config) (
+	config_obj *config_proto.Config) (
 	string, error) {
 	artifact := template_engine.GetArtifact()
 
-	repository, err := artifacts.GetGlobalRepository(config_obj)
+	manager, err := services.GetRepositoryManager()
 	if err != nil {
 		return "", err
 	}
 
-	template_artifact, pres := repository.Get("Server.Internal.ArtifactDescription")
+	repository, err := manager.GetGlobalRepository(config_obj)
+	if err != nil {
+		return "", err
+	}
+
+	template_artifact, pres := repository.Get(
+		config_obj, "Server.Internal.ArtifactDescription")
 	if pres {
 		template_engine.SetEnv("artifact", artifact)
 		for _, report := range getArtifactReports(
 			template_artifact, []string{"internal"}) {
-			return template_engine.Execute(report.Template)
+			return template_engine.Execute(report)
 		}
 	}
+
 	return "", nil
 }
 
@@ -164,7 +210,7 @@ func getArtifactReports(
 			Template: fmt.Sprintf(`
 ## %s
 
-{{ Query "SELECT * FROM source(%s) LIMIT 500" | Table }}
+{{ Query "SELECT * FROM source(%s) LIMIT 100" | Table }}
 
 `, name, parameters),
 		})
@@ -196,7 +242,7 @@ func GenerateServerMonitoringReport(
 			template_engine.SetEnv(param.Name, param.Default)
 		}
 
-		value, err := template_engine.Execute(report.Template)
+		value, err := template_engine.Execute(report)
 		if err != nil {
 			return "", err
 		}
@@ -229,7 +275,7 @@ func GenerateClientReport(template_engine TemplateEngine,
 			template_engine.SetEnv(param.Name, param.Default)
 		}
 
-		value, err := template_engine.Execute(report.Template)
+		value, err := template_engine.Execute(report)
 		if err != nil {
 			return "", err
 		}
@@ -260,7 +306,7 @@ func GenerateHuntReport(template_engine TemplateEngine,
 			template_engine.SetEnv(param.Name, param.Default)
 		}
 
-		value, err := template_engine.Execute(report.Template)
+		value, err := template_engine.Execute(report)
 		if err != nil {
 			return "", err
 		}
@@ -271,30 +317,56 @@ func GenerateHuntReport(template_engine TemplateEngine,
 }
 
 func newBaseTemplateEngine(
-	config_obj *api_proto.Config,
+	config_obj *config_proto.Config,
+	scope vfilter.Scope,
+	acl_manager vql_subsystem.ACLManager,
+	repository services.Repository,
 	artifact_name string) (
 	*BaseTemplateEngine, error) {
-	repository, err := artifacts.GetGlobalRepository(config_obj)
-	if err != nil {
-		return nil, err
-	}
 
-	artifact, pres := repository.Get(artifact_name)
+	artifact, pres := repository.Get(config_obj, artifact_name)
 	if !pres {
-		return nil, errors.New(
-			fmt.Sprintf("Artifact %v not known.", artifact_name))
+		return nil, fmt.Errorf(
+			"Artifact %v not known.", artifact_name)
 	}
 
-	env := vfilter.NewDict().
-		Set("config", config_obj.Client).
-		Set("server_config", config_obj).
-		Set(vql_subsystem.CACHE_VAR, vql_subsystem.NewScopeCache())
+	// The template shares the same scope environment for the
+	// whole processing. Keep a reference to the environment so
+	// SetEnv() can update it later.
+	env := ordereddict.NewDict()
+	if scope == nil {
+		manager, err := services.GetRepositoryManager()
+		if err != nil {
+			return nil, err
+		}
 
-	scope := artifacts.MakeScope(repository).AppendVars(env)
+		scope = manager.BuildScope(
+			services.ScopeBuilder{
+				Config:     config_obj,
+				ACLManager: acl_manager,
+			})
+	}
+	scope.AppendVars(env)
+
+	// Closing the scope is deferred to closing the template.
+
 	return &BaseTemplateEngine{
-		Artifact: artifact,
-		Scope:    scope,
-		Env:      env,
-		logger:   logging.GetLogger(config_obj, &logging.FrontendComponent),
+		Artifact:   artifact,
+		Repository: repository,
+		Scope:      scope,
+		Env:        env,
+		logger:     logging.GetLogger(config_obj, &logging.FrontendComponent),
+		config_obj: config_obj,
 	}, nil
+}
+
+// Go templates require template escape sequences to be all on one
+// line. This makes it very hard to work with due to wrapping and does
+// not look good. We therefore allow people to continue lines by
+// having a backslash on the end of the line, and just remove it here.
+
+var query_regexp = regexp.MustCompile("\\\\[\n\r]")
+
+func SanitizeGoTemplates(template string) string {
+	return query_regexp.ReplaceAllString(template, "")
 }

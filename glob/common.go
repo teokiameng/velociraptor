@@ -68,16 +68,20 @@ func (self *VirtualDirectoryPath) FullPath() string {
 	return self.drive
 }
 
-func (self *VirtualDirectoryPath) Atime() TimeVal {
-	return TimeVal{}
+func (self *VirtualDirectoryPath) Atime() time.Time {
+	return time.Time{}
 }
 
-func (self *VirtualDirectoryPath) Mtime() TimeVal {
-	return TimeVal{}
+func (self *VirtualDirectoryPath) Mtime() time.Time {
+	return time.Time{}
 }
 
-func (self *VirtualDirectoryPath) Ctime() TimeVal {
-	return TimeVal{}
+func (self *VirtualDirectoryPath) Btime() time.Time {
+	return time.Time{}
+}
+
+func (self *VirtualDirectoryPath) Ctime() time.Time {
+	return time.Time{}
 }
 
 // Not supported

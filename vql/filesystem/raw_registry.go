@@ -31,9 +31,7 @@ package filesystem
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
 	"net/url"
 	"os"
 	"path"
@@ -41,10 +39,16 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Velocidex/ordereddict"
 	errors "github.com/pkg/errors"
 	"www.velocidex.com/golang/regparser"
+	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
+	"www.velocidex.com/golang/velociraptor/constants"
 	"www.velocidex.com/golang/velociraptor/glob"
+	"www.velocidex.com/golang/velociraptor/json"
+	"www.velocidex.com/golang/velociraptor/utils"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
+	"www.velocidex.com/golang/velociraptor/vql/readers"
 	"www.velocidex.com/golang/vfilter"
 )
 
@@ -53,8 +57,9 @@ const (
 )
 
 type RawRegKeyInfo struct {
-	key        *regparser.CM_KEY_NODE
-	_full_path string
+	key         *regparser.CM_KEY_NODE
+	_base       url.URL
+	_components []string
 }
 
 func (self *RawRegKeyInfo) IsDir() bool {
@@ -62,7 +67,7 @@ func (self *RawRegKeyInfo) IsDir() bool {
 }
 
 func (self *RawRegKeyInfo) Data() interface{} {
-	return vfilter.NewDict().Set("type", "Key")
+	return ordereddict.NewDict().Set("type", "Key")
 }
 
 func (self *RawRegKeyInfo) Size() int64 {
@@ -74,7 +79,8 @@ func (self *RawRegKeyInfo) Sys() interface{} {
 }
 
 func (self *RawRegKeyInfo) FullPath() string {
-	return self._full_path
+	self._base.Fragment = utils.JoinComponents(self._components, "\\")
+	return self._base.String()
 }
 
 func (self *RawRegKeyInfo) Mode() os.FileMode {
@@ -89,19 +95,19 @@ func (self *RawRegKeyInfo) ModTime() time.Time {
 	return self.key.LastWriteTime().Time
 }
 
-func (self *RawRegKeyInfo) Mtime() glob.TimeVal {
-	nsec := self.ModTime().UnixNano()
-	return glob.TimeVal{
-		Sec:  nsec / 1000000000,
-		Nsec: nsec,
-	}
+func (self *RawRegKeyInfo) Mtime() time.Time {
+	return self.ModTime()
 }
 
-func (self *RawRegKeyInfo) Ctime() glob.TimeVal {
+func (self *RawRegKeyInfo) Ctime() time.Time {
 	return self.Mtime()
 }
 
-func (self *RawRegKeyInfo) Atime() glob.TimeVal {
+func (self *RawRegKeyInfo) Btime() time.Time {
+	return self.Mtime()
+}
+
+func (self *RawRegKeyInfo) Atime() time.Time {
 	return self.Mtime()
 }
 
@@ -114,25 +120,7 @@ func (self *RawRegKeyInfo) GetLink() (string, error) {
 	return "", errors.New("Not implemented")
 }
 
-func (self RawRegKeyInfo) MarshalJSON() ([]byte, error) {
-	result, err := json.Marshal(&struct {
-		FullPath string
-		Data     interface{}
-		Mtime    glob.TimeVal
-		Ctime    glob.TimeVal
-		Atime    glob.TimeVal
-	}{
-		FullPath: self.FullPath(),
-		Mtime:    self.Mtime(),
-		Ctime:    self.Ctime(),
-		Atime:    self.Atime(),
-		Data:     self.Data(),
-	})
-
-	return result, err
-}
-
-func (u *RawRegKeyInfo) UnmarshalJSON(data []byte) error {
+func (self *RawRegKeyInfo) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
@@ -164,7 +152,7 @@ func (self *RawRegValueInfo) Size() int64 {
 
 func (self *RawRegValueInfo) Data() interface{} {
 	value_data := self.value.ValueData()
-	result := vfilter.NewDict().
+	result := ordereddict.NewDict().
 		Set("type", self.value.TypeString()).
 		Set("data_len", len(value_data.Data))
 
@@ -180,26 +168,6 @@ func (self *RawRegValueInfo) Data() interface{} {
 		}
 	}
 	return result
-}
-
-func (self RawRegValueInfo) MarshalJSON() ([]byte, error) {
-	result, err := json.Marshal(&struct {
-		FullPath string
-		Type     string
-		Data     interface{}
-		Mtime    glob.TimeVal
-		Ctime    glob.TimeVal
-		Atime    glob.TimeVal
-	}{
-		FullPath: self.FullPath(),
-		Mtime:    self.Mtime(),
-		Ctime:    self.Ctime(),
-		Atime:    self.Atime(),
-		Type:     self.value.TypeString(),
-		Data:     self.Data(),
-	})
-
-	return result, err
 }
 
 type RawValueBuffer struct {
@@ -222,110 +190,107 @@ func NewRawValueBuffer(buf string, stat *RawRegValueInfo) *RawValueBuffer {
 	}
 }
 
-type RawRegistryFileCache struct {
-	registry *regparser.Registry
-	fd       glob.ReadSeekCloser
-}
-
 type RawRegFileSystemAccessor struct {
-	mu       sync.Mutex
-	fd_cache map[string]*RawRegistryFileCache
+	mu sync.Mutex
+
+	// Maintain a cache of already parsed hives
+	hive_cache map[string]*regparser.Registry
+	scope      vfilter.Scope
 }
 
 func (self *RawRegFileSystemAccessor) getRegHive(
-	file_path string) (*RawRegistryFileCache, *url.URL, error) {
-	url, err := url.Parse(file_path)
+	file_path string) (*regparser.Registry, *url.URL, error) {
+
+	// The file path is a url specifying the path to a key:
+	// Scheme is the underlying accessor
+	// Path is the path to be provided to the underlying accessor
+	// Fragment is the path within the reg hive that we need to open.
+	full_url, err := url.Parse(file_path)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	accessor, err := glob.GetAccessor(url.Scheme, context.Background())
-	if err != nil {
-		return nil, nil, err
-	}
-	base_url := *url
+	// Cache the parsed hive under the underlying file.
+	base_url := *full_url
 	base_url.Fragment = ""
+	cache_key := base_url.String()
 
 	self.mu.Lock()
 	defer self.mu.Unlock()
 
-	file_cache, pres := self.fd_cache[base_url.String()]
+	lru_size := vql_subsystem.GetIntFromRow(
+		self.scope, self.scope, constants.RAW_REG_CACHE_SIZE)
+	hive, pres := self.hive_cache[cache_key]
 	if !pres {
-		fd, err := accessor.Open(url.Path)
+		paged_reader := readers.NewPagedReader(
+			self.scope,
+			base_url.Scheme, // Accessor
+			base_url.Path,   // Path to underlying file
+			int(lru_size),
+		)
+		hive, err = regparser.NewRegistry(paged_reader)
 		if err != nil {
+			paged_reader.Close()
 			return nil, nil, err
 		}
 
-		reader, ok := fd.(io.ReaderAt)
-		if !ok {
-			return nil, nil, errors.New("file is not seekable")
-		}
-
-		registry, err := regparser.NewRegistry(reader)
-		if err != nil {
-			return nil, nil, err
-		}
-
-		file_cache = &RawRegistryFileCache{
-			registry: registry, fd: fd}
-
-		self.fd_cache[url.String()] = file_cache
+		self.hive_cache[cache_key] = hive
 	}
 
-	return file_cache, url, nil
+	return hive, full_url, nil
 }
 
-func (self *RawRegFileSystemAccessor) New(
-	ctx context.Context) glob.FileSystemAccessor {
-	result := &RawRegFileSystemAccessor{
-		fd_cache: make(map[string]*RawRegistryFileCache),
+const RawRegFileSystemTag = "_RawReg"
+
+func (self *RawRegFileSystemAccessor) New(scope vfilter.Scope) (
+	glob.FileSystemAccessor, error) {
+
+	result_any := vql_subsystem.CacheGet(scope, RawRegFileSystemTag)
+	if result_any == nil {
+		result := &RawRegFileSystemAccessor{
+			hive_cache: make(map[string]*regparser.Registry),
+			scope:      scope,
+		}
+		vql_subsystem.CacheSet(scope, RawRegFileSystemTag, result)
+		return result, nil
 	}
 
-	// When the context is done, close all the files.
-	go func() {
-		select {
-		case <-ctx.Done():
-			result.mu.Lock()
-			defer result.mu.Unlock()
-
-			for _, v := range result.fd_cache {
-				v.fd.Close()
-			}
-
-			result.fd_cache = make(
-				map[string]*RawRegistryFileCache)
-		}
-	}()
-
-	return result
+	return result_any.(glob.FileSystemAccessor), nil
 }
 
 func (self *RawRegFileSystemAccessor) ReadDir(key_path string) ([]glob.FileInfo, error) {
 	var result []glob.FileInfo
-	file_cache, url, err := self.getRegHive(key_path)
+	hive, url, err := self.getRegHive(key_path)
 	if err != nil {
 		return nil, err
 	}
-	key := file_cache.registry.OpenKey(url.Fragment)
+
+	key := hive.OpenKey(url.Fragment)
 	if key == nil {
 		return nil, errors.New("Key not found")
 	}
 
+	components := utils.SplitComponents(url.Fragment)
+
 	for _, subkey := range key.Subkeys() {
+		new_components := append([]string{}, components...)
 		result = append(result,
 			&RawRegKeyInfo{
-				subkey,
-				self.PathJoin(key_path, subkey.Name()),
+				key:         subkey,
+				_base:       *url,
+				_components: append(new_components, subkey.Name()),
 			})
 	}
 
 	for _, value := range key.Values() {
+		new_components := append([]string{}, components...)
+
 		result = append(result,
 			&RawRegValueInfo{
 				&RawRegKeyInfo{
-					key,
-					self.PathJoin(
-						key_path, value.ValueName()),
+					key:         key,
+					_base:       *url,
+					_components: append(new_components, value.ValueName()),
 				}, value,
 			})
 	}
@@ -333,7 +298,7 @@ func (self *RawRegFileSystemAccessor) ReadDir(key_path string) ([]glob.FileInfo,
 	return result, nil
 }
 
-func (self RawRegFileSystemAccessor) Open(path string) (glob.ReadSeekCloser, error) {
+func (self *RawRegFileSystemAccessor) Open(path string) (glob.ReadSeekCloser, error) {
 	return nil, errors.New("Not implemented")
 }
 
@@ -355,16 +320,10 @@ func (self *RawRegFileSystemAccessor) GetRoot(path string) (string, string, erro
 
 // We accept both / and \ as a path separator
 func (self *RawRegFileSystemAccessor) PathSplit(path string) []string {
-	return regparser.SplitComponents(path)
+	return utils.SplitComponents(path)
 }
 
 func (self *RawRegFileSystemAccessor) PathJoin(root, stem string) string {
-	// If any of the subsequent components contain
-	// a slash then escape them together.
-	if strings.Contains(stem, "/") {
-		stem = "\"" + stem + "\""
-	}
-
 	url, err := url.Parse(root)
 	if err != nil {
 		fmt.Printf("Error %v Joining %v and %v -> %v\n",
@@ -372,7 +331,7 @@ func (self *RawRegFileSystemAccessor) PathJoin(root, stem string) string {
 		return path.Join(root, stem)
 	}
 
-	url.Fragment = path.Join(url.Fragment, stem)
+	url.Fragment = utils.PathJoin(url.Fragment, stem, "/")
 
 	result := url.String()
 
@@ -388,13 +347,18 @@ type ReadKeyValues struct{}
 
 func (self ReadKeyValues) Call(
 	ctx context.Context,
-	scope *vfilter.Scope,
-	args *vfilter.Dict) <-chan vfilter.Row {
+	scope vfilter.Scope,
+	args *ordereddict.Dict) <-chan vfilter.Row {
 	globber := make(glob.Globber)
 	output_chan := make(chan vfilter.Row)
 
 	go func() {
 		defer close(output_chan)
+
+		config_obj, ok := vql_subsystem.GetServerConfig(scope)
+		if !ok {
+			config_obj = &config_proto.Config{}
+		}
 
 		arg := &ReadKeyValuesArgs{}
 		err := vfilter.ExtractArgs(scope, args, arg)
@@ -408,7 +372,13 @@ func (self ReadKeyValues) Call(
 			accessor_name = "reg"
 		}
 
-		accessor, err := glob.GetAccessor(accessor_name, ctx)
+		err = vql_subsystem.CheckFilesystemAccess(scope, arg.Accessor)
+		if err != nil {
+			scope.Log("read_reg_key: %s", err.Error())
+			return
+		}
+
+		accessor, err := glob.GetAccessor(accessor_name, scope)
 		if err != nil {
 			scope.Log("read_reg_key: %v", err)
 			return
@@ -422,11 +392,15 @@ func (self ReadKeyValues) Call(
 				continue
 			}
 			root = item_root
-			globber.Add(item_path, accessor.PathSplit)
+			err = globber.Add(item_path, accessor.PathSplit)
+			if err != nil {
+				scope.Log("glob: %v", err)
+				return
+			}
 		}
 
 		file_chan := globber.ExpandWithContext(
-			ctx, root, accessor)
+			ctx, config_obj, root, accessor)
 		for {
 			select {
 			case <-ctx.Done():
@@ -437,7 +411,7 @@ func (self ReadKeyValues) Call(
 					return
 				}
 				if f.IsDir() {
-					res := vfilter.NewDict().
+					res := ordereddict.NewDict().
 						SetDefault(&vfilter.Null{}).
 						SetCaseInsensitive().
 						Set("Key", f)
@@ -449,7 +423,7 @@ func (self ReadKeyValues) Call(
 					for _, item := range values {
 						value_info, ok := item.(glob.FileInfo)
 						if ok {
-							value_data, ok := value_info.Data().(*vfilter.Dict)
+							value_data, ok := value_info.Data().(*ordereddict.Dict)
 							if ok && value_data != nil {
 								value, pres := value_data.Get("value")
 								if pres {
@@ -458,7 +432,13 @@ func (self ReadKeyValues) Call(
 							}
 						}
 					}
-					output_chan <- res
+
+					select {
+					case <-ctx.Done():
+						return
+
+					case output_chan <- res:
+					}
 				}
 			}
 		}
@@ -467,7 +447,7 @@ func (self ReadKeyValues) Call(
 	return output_chan
 }
 
-func (self ReadKeyValues) Info(scope *vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.PluginInfo {
+func (self ReadKeyValues) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.PluginInfo {
 	return &vfilter.PluginInfo{
 		Name: "read_reg_key",
 		Doc: "This is a convenience function for reading the entire " +
@@ -480,4 +460,7 @@ func (self ReadKeyValues) Info(scope *vfilter.Scope, type_map *vfilter.TypeMap) 
 func init() {
 	glob.Register("raw_reg", &RawRegFileSystemAccessor{})
 	vql_subsystem.RegisterPlugin(&ReadKeyValues{})
+
+	json.RegisterCustomEncoder(&RawRegKeyInfo{}, glob.MarshalGlobFileInfo)
+	json.RegisterCustomEncoder(&RawRegValueInfo{}, glob.MarshalGlobFileInfo)
 }

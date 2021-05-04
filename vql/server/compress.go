@@ -1,3 +1,5 @@
+// +build server_vql
+
 /*
    Velociraptor - Hunting Evil
    Copyright (C) 2019 Velocidex Innovations.
@@ -20,10 +22,11 @@ package server
 import (
 	"compress/gzip"
 	"context"
-	"io"
 
-	api_proto "www.velocidex.com/golang/velociraptor/api/proto"
+	"github.com/Velocidex/ordereddict"
+	"www.velocidex.com/golang/velociraptor/acls"
 	"www.velocidex.com/golang/velociraptor/file_store"
+	"www.velocidex.com/golang/velociraptor/utils"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
 )
@@ -35,17 +38,23 @@ type CompressArgs struct {
 type Compress struct{}
 
 func (self *Compress) Call(ctx context.Context,
-	scope *vfilter.Scope,
-	args *vfilter.Dict) vfilter.Any {
+	scope vfilter.Scope,
+	args *ordereddict.Dict) vfilter.Any {
+
+	err := vql_subsystem.CheckAccess(scope, acls.FILESYSTEM_WRITE)
+	if err != nil {
+		scope.Log("compress: %v", err)
+		return vfilter.Null{}
+	}
+
 	arg := &CompressArgs{}
-	err := vfilter.ExtractArgs(scope, args, arg)
+	err = vfilter.ExtractArgs(scope, args, arg)
 	if err != nil {
 		scope.Log("compress: %s", err.Error())
 		return vfilter.Null{}
 	}
 
-	any_config_obj, _ := scope.Resolve("server_config")
-	config_obj, ok := any_config_obj.(*api_proto.Config)
+	config_obj, ok := vql_subsystem.GetServerConfig(scope)
 	if !ok {
 		scope.Log("Command can only run on the server")
 		return vfilter.Null{}
@@ -74,7 +83,7 @@ func (self *Compress) Call(ctx context.Context,
 
 			zw.Name = path
 
-			_, err = io.Copy(zw, fd)
+			_, err = utils.Copy(ctx, zw, fd)
 			if err != nil {
 				scope.Log("compress: %v", err)
 				err2 := file_store_factory.Delete(path + ".gz")
@@ -96,7 +105,7 @@ func (self *Compress) Call(ctx context.Context,
 	return result
 }
 
-func (self Compress) Info(scope *vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
+func (self Compress) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
 		Name:    "compress",
 		Doc:     "Compress a file in the server's FileStore. ",

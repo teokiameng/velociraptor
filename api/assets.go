@@ -1,5 +1,3 @@
-// +build release
-
 /*
    Velociraptor - Hunting Evil
    Copyright (C) 2019 Velocidex Innovations.
@@ -26,22 +24,31 @@ import (
 	"net/http"
 	"time"
 
-	api_proto "www.velocidex.com/golang/velociraptor/api/proto"
-	"www.velocidex.com/golang/velociraptor/gui/assets"
+	"github.com/gorilla/csrf"
+	"www.velocidex.com/golang/velociraptor/api/proto"
+	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
+	gui_assets "www.velocidex.com/golang/velociraptor/gui/velociraptor"
+	users "www.velocidex.com/golang/velociraptor/users"
+	"www.velocidex.com/golang/velociraptor/utils"
 )
 
-func install_static_assets(config_obj *api_proto.Config, mux *http.ServeMux) {
-	dir := "/static/"
-	mux.Handle(dir, http.FileServer(assets.HTTP))
+func install_static_assets(config_obj *config_proto.Config, mux *http.ServeMux) {
+	base := ""
+	if config_obj.GUI != nil {
+		base = config_obj.GUI.BasePath
+	}
+	dir := base + "/app/"
+	mux.Handle(dir, http.StripPrefix(dir, http.FileServer(gui_assets.HTTP)))
 	mux.Handle("/favicon.png",
-		http.RedirectHandler("/static/images/favicon.ico",
+		http.RedirectHandler(base+"/static/images/favicon.ico",
 			http.StatusMovedPermanently))
 }
 
 func GetTemplateHandler(
-	config_obj *api_proto.Config, template_name string) (http.Handler, error) {
-	data, err := assets.ReadFile(template_name)
+	config_obj *config_proto.Config, template_name string) (http.Handler, error) {
+	data, err := gui_assets.ReadFile(template_name)
 	if err != nil {
+		utils.Debug(err)
 		return nil, err
 	}
 
@@ -50,12 +57,31 @@ func GetTemplateHandler(
 		return nil, err
 	}
 
+	base := config_obj.GUI.BasePath
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		userinfo := GetUserInfo(r.Context(), config_obj)
+
+		// This should never happen!
+		if userinfo.Name == "" {
+			returnError(w, 401, "Unauthenticated access.")
+			return
+		}
+
+		user_options, err := users.GetUserOptions(config_obj, userinfo.Name)
+		if err != nil {
+			// Options may not exist yet
+			user_options = &proto.SetGUIOptionsRequest{}
+		}
+
 		args := _templateArgs{
 			Timestamp: time.Now().UTC().UnixNano() / 1000,
+			CsrfToken: csrf.Token(r),
+			BasePath:  base,
 			Heading:   "Heading",
+			UserTheme: user_options.Theme,
 		}
-		err := tmpl.Execute(w, args)
+		err = tmpl.Execute(w, args)
 		if err != nil {
 			w.WriteHeader(500)
 		}

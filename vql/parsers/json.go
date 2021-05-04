@@ -18,15 +18,16 @@
 package parsers
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"reflect"
 	"strconv"
 	"strings"
 
-	"github.com/golang/protobuf/proto"
-	"github.com/golang/protobuf/ptypes"
-	"github.com/golang/protobuf/ptypes/any"
+	"github.com/Velocidex/ordereddict"
+	"google.golang.org/protobuf/reflect/protoreflect"
+	"www.velocidex.com/golang/velociraptor/glob"
 	utils "www.velocidex.com/golang/velociraptor/utils"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
@@ -37,7 +38,7 @@ type ParseJsonFunctionArg struct {
 }
 type ParseJsonFunction struct{}
 
-func (self ParseJsonFunction) Info(scope *vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
+func (self ParseJsonFunction) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
 		Name:    "parse_json",
 		Doc:     "Parse a JSON string into an object.",
@@ -46,8 +47,8 @@ func (self ParseJsonFunction) Info(scope *vfilter.Scope, type_map *vfilter.TypeM
 }
 
 func (self ParseJsonFunction) Call(
-	ctx context.Context, scope *vfilter.Scope,
-	args *vfilter.Dict) vfilter.Any {
+	ctx context.Context, scope vfilter.Scope,
+	args *ordereddict.Dict) vfilter.Any {
 	arg := &ParseJsonFunctionArg{}
 	err := vfilter.ExtractArgs(scope, args, arg)
 	if err != nil {
@@ -55,8 +56,8 @@ func (self ParseJsonFunction) Call(
 		return &vfilter.Null{}
 	}
 
-	result := make(map[string]interface{})
-	err = json.Unmarshal([]byte(arg.Data), &result)
+	result := ordereddict.NewDict()
+	err = json.Unmarshal([]byte(arg.Data), result)
 	if err != nil {
 		scope.Log("parse_json: %v", err)
 		return &vfilter.Null{}
@@ -66,7 +67,7 @@ func (self ParseJsonFunction) Call(
 
 type ParseJsonArray struct{}
 
-func (self ParseJsonArray) Info(scope *vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
+func (self ParseJsonArray) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
 		Name:    "parse_json_array",
 		Doc:     "Parse a JSON string into an array.",
@@ -75,22 +76,162 @@ func (self ParseJsonArray) Info(scope *vfilter.Scope, type_map *vfilter.TypeMap)
 }
 
 func (self ParseJsonArray) Call(
-	ctx context.Context, scope *vfilter.Scope,
-	args *vfilter.Dict) vfilter.Any {
+	ctx context.Context, scope vfilter.Scope,
+	args *ordereddict.Dict) vfilter.Any {
 	arg := &ParseJsonFunctionArg{}
 	err := vfilter.ExtractArgs(scope, args, arg)
-	if err != nil {
-		scope.Log("parse_json: %v", err)
-		return &vfilter.Null{}
-	}
-
-	result := []interface{}{}
-	err = json.Unmarshal([]byte(arg.Data), &result)
 	if err != nil {
 		scope.Log("parse_json_array: %v", err)
 		return &vfilter.Null{}
 	}
+
+	result_array := []json.RawMessage{}
+	err = json.Unmarshal([]byte(arg.Data), &result_array)
+	if err != nil {
+		scope.Log("parse_json_array: %v", err)
+		return &vfilter.Null{}
+	}
+
+	result := make([]vfilter.Any, 0, len(result_array))
+	for _, item := range result_array {
+		dict := ordereddict.NewDict()
+		err = json.Unmarshal(item, dict)
+		if err != nil {
+			// It might not be a dict - support any value.
+			var any_value interface{}
+			err = json.Unmarshal(item, &any_value)
+			if err != nil {
+				scope.Log("parse_json_array: %v", err)
+				return &vfilter.Null{}
+			}
+
+			result = append(result, any_value)
+			continue
+		}
+
+		result = append(result, dict)
+	}
+
 	return result
+}
+
+type ParseJsonlPluginArgs struct {
+	Filename string `vfilter:"required,field=filename,doc=JSON file to open"`
+	Accessor string `vfilter:"optional,field=accessor,doc=The accessor to use"`
+}
+
+type ParseJsonlPlugin struct{}
+
+func (self ParseJsonlPlugin) Call(
+	ctx context.Context,
+	scope vfilter.Scope,
+	args *ordereddict.Dict) <-chan vfilter.Row {
+	output_chan := make(chan vfilter.Row)
+
+	go func() {
+		defer close(output_chan)
+
+		arg := &ParseJsonlPluginArgs{}
+		err := vfilter.ExtractArgs(scope, args, arg)
+		if err != nil {
+			scope.Log("parse_jsonl: %s", err.Error())
+			return
+		}
+
+		err = vql_subsystem.CheckFilesystemAccess(scope, arg.Accessor)
+		if err != nil {
+			scope.Log("parse_jsonl: %s", err)
+			return
+		}
+
+		accessor, err := glob.GetAccessor(arg.Accessor, scope)
+		if err != nil {
+			scope.Log("parse_jsonl: %v", err)
+			return
+		}
+
+		fd, err := accessor.Open(arg.Filename)
+		if err != nil {
+			scope.Log("Unable to open file %s: %v",
+				arg.Filename, err)
+			return
+		}
+		defer fd.Close()
+
+		reader := bufio.NewReader(fd)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+
+			default:
+				row_data, err := reader.ReadBytes('\n')
+				if err != nil {
+					return
+				}
+				item := ordereddict.NewDict()
+				err = item.UnmarshalJSON(row_data)
+				if err != nil {
+					return
+				}
+
+				select {
+				case <-ctx.Done():
+					return
+
+				case output_chan <- item:
+				}
+			}
+		}
+	}()
+
+	return output_chan
+}
+
+func (self ParseJsonlPlugin) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.PluginInfo {
+	return &vfilter.PluginInfo{
+		Name:    "parse_jsonl",
+		Doc:     "Parses a line oriented json file.",
+		ArgType: type_map.AddType(scope, &ParseJsonlPluginArgs{}),
+	}
+}
+
+type ParseJsonArrayPlugin struct{}
+
+func (self ParseJsonArrayPlugin) Call(
+	ctx context.Context,
+	scope vfilter.Scope,
+	args *ordereddict.Dict) <-chan vfilter.Row {
+	output_chan := make(chan vfilter.Row)
+
+	go func() {
+		defer close(output_chan)
+
+		result := ParseJsonArray{}.Call(ctx, scope, args)
+		result_value := reflect.Indirect(reflect.ValueOf(result))
+		result_type := result_value.Type()
+		if result_type.Kind() == reflect.Slice {
+			for i := 0; i < result_value.Len(); i++ {
+				select {
+				case <-ctx.Done():
+					return
+
+				case output_chan <- result_value.Index(i).Interface():
+				}
+			}
+		}
+
+	}()
+
+	return output_chan
+}
+
+func (self ParseJsonArrayPlugin) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.PluginInfo {
+	return &vfilter.PluginInfo{
+		Name:    "parse_json_array",
+		Doc:     "Parses events from a line oriented json file.",
+		ArgType: type_map.AddType(scope, &ParseJsonFunctionArg{}),
+	}
 }
 
 // Associative protocol for map[string]interface{}
@@ -99,7 +240,11 @@ type _MapInterfaceAssociativeProtocol struct{}
 func (self _MapInterfaceAssociativeProtocol) Applicable(
 	a vfilter.Any, b vfilter.Any) bool {
 
-	if reflect.TypeOf(a).Kind() != reflect.Map {
+	a_type := reflect.TypeOf(a)
+	if a_type == nil {
+		return false
+	}
+	if a_type.Kind() != reflect.Map {
 		return false
 	}
 
@@ -108,7 +253,7 @@ func (self _MapInterfaceAssociativeProtocol) Applicable(
 }
 
 func (self _MapInterfaceAssociativeProtocol) Associative(
-	scope *vfilter.Scope, a vfilter.Any, b vfilter.Any) (
+	scope vfilter.Scope, a vfilter.Any, b vfilter.Any) (
 	vfilter.Any, bool) {
 
 	key, key_ok := b.(string)
@@ -131,7 +276,7 @@ func (self _MapInterfaceAssociativeProtocol) Associative(
 }
 
 func (self _MapInterfaceAssociativeProtocol) GetMembers(
-	scope *vfilter.Scope, a vfilter.Any) []string {
+	scope vfilter.Scope, a vfilter.Any) []string {
 	result := []string{}
 	a_map, ok := a.(map[string]interface{})
 	if ok {
@@ -163,7 +308,7 @@ func (self _ProtobufAssociativeProtocol) Applicable(
 	_, b_ok := b.(string)
 	if b_ok {
 		switch a.(type) {
-		case proto.Message, *proto.Message:
+		case protoreflect.ProtoMessage:
 			return true
 		}
 	}
@@ -174,7 +319,7 @@ func (self _ProtobufAssociativeProtocol) Applicable(
 // Accept either the json emitted field name or the go style field
 // name.
 func (self _ProtobufAssociativeProtocol) Associative(
-	scope *vfilter.Scope, a vfilter.Any, b vfilter.Any) (
+	scope vfilter.Scope, a vfilter.Any, b vfilter.Any) (
 	vfilter.Any, bool) {
 
 	field, b_ok := b.(string)
@@ -189,58 +334,67 @@ func (self _ProtobufAssociativeProtocol) Associative(
 	a_value := reflect.Indirect(reflect.ValueOf(a))
 	a_type := a_value.Type()
 
-	properties := proto.GetProperties(a_type)
-	if properties == nil {
-		return nil, false
-	}
-
-	for _, item := range properties.Prop {
-		if field == item.OrigName || field == item.Name {
-			result, pres := vfilter.DefaultAssociative{}.Associative(
-				scope, a, item.Name)
-
-			// If the result is an any, we decode that
-			// dynamically. This is more useful than a
-			// binary blob.
-			any_result, ok := result.(*any.Any)
-			if ok {
-				var tmp_args ptypes.DynamicAny
-				err := ptypes.UnmarshalAny(any_result, &tmp_args)
-				if err == nil {
-					return tmp_args.Message, pres
-				}
+	// Protobuf reflection API V2 is far too complicated - this is
+	// a hack but works ok for now.
+	for i := 0; i < a_type.NumField(); i++ {
+		struct_field := a_type.Field(i)
+		if field == struct_field.Name {
+			field_value := a_value.Field(i)
+			if field_value.CanInterface() {
+				return field_value.Interface(), true
 			}
+		}
 
-			return result, pres
+		json_tag := strings.Split(struct_field.Tag.Get("json"), ",")
+		if field == json_tag[0] {
+			field_value := a_value.Field(i)
+			if field_value.CanInterface() {
+				return a_value.Field(i).Interface(), true
+			}
 		}
 	}
-
-	return nil, false
+	return vfilter.Null{}, false
 }
 
 // Emit the json serializable field name only. This makes this field
 // consistent with the same protobuf emitted as json using other
 // means.
 func (self _ProtobufAssociativeProtocol) GetMembers(
-	scope *vfilter.Scope, a vfilter.Any) []string {
+	scope vfilter.Scope, a vfilter.Any) []string {
 	result := []string{}
 
 	a_value := reflect.Indirect(reflect.ValueOf(a))
 	a_type := a_value.Type()
 
-	properties := proto.GetProperties(a_type)
-	if properties == nil {
-		return result
-	}
-
-	for _, item := range properties.Prop {
-		// Only real exported fields should be collected.
-		if len(item.JSONName) > 0 {
-			result = append(result, item.OrigName)
+	for i := 0; i < a_type.NumField(); i++ {
+		struct_field := a_type.Field(i)
+		json_tag := strings.Split(struct_field.Tag.Get("json"), ",")[0]
+		if json_tag != "" {
+			result = append(result, json_tag)
 		}
 	}
-
 	return result
+}
+
+type _nilAssociativeProtocol struct{}
+
+func (self _nilAssociativeProtocol) Applicable(
+	a vfilter.Any, b vfilter.Any) bool {
+
+	value := reflect.ValueOf(a)
+	return value.Kind() == reflect.Ptr && value.IsNil()
+}
+
+func (self _nilAssociativeProtocol) Associative(
+	scope vfilter.Scope, a vfilter.Any, b vfilter.Any) (
+	vfilter.Any, bool) {
+
+	return vfilter.Null{}, false
+}
+
+func (self _nilAssociativeProtocol) GetMembers(
+	scope vfilter.Scope, a vfilter.Any) []string {
+	return []string{}
 }
 
 // Allow a slice to be accessed by a field
@@ -248,7 +402,6 @@ type _IndexAssociativeProtocol struct{}
 
 func (self _IndexAssociativeProtocol) Applicable(
 	a vfilter.Any, b vfilter.Any) bool {
-
 	a_value := reflect.Indirect(reflect.ValueOf(a))
 	a_type := a_value.Type()
 	if a_type.Kind() != reflect.Slice {
@@ -261,15 +414,19 @@ func (self _IndexAssociativeProtocol) Applicable(
 		if err == nil {
 			return true
 		}
-	case int, float64, uint64:
+	case int, float64, uint64, int64, *int, *float64, *uint64, *int64:
 		return true
 	}
 	return false
 }
 
 func (self _IndexAssociativeProtocol) Associative(
-	scope *vfilter.Scope, a vfilter.Any, b vfilter.Any) (
+	scope vfilter.Scope, a vfilter.Any, b vfilter.Any) (
 	vfilter.Any, bool) {
+
+	if b == nil {
+		return vfilter.Null{}, false
+	}
 
 	idx := 0
 	switch t := b.(type) {
@@ -281,6 +438,16 @@ func (self _IndexAssociativeProtocol) Associative(
 		idx = int(t)
 	case uint64:
 		idx = int(t)
+	case int64:
+		idx = int(t)
+	case *int:
+		idx = int(*t)
+	case *float64:
+		idx = int(*t)
+	case *uint64:
+		idx = int(*t)
+	case *int64:
+		idx = int(*t)
 
 	default:
 		return vfilter.Null{}, false
@@ -291,20 +458,28 @@ func (self _IndexAssociativeProtocol) Associative(
 		return vfilter.Null{}, false
 	}
 
-	idx = idx % a_value.Len()
-
+	// Modulus for negative numbers should wrap around the length
+	// of the array aka python style modulus
+	// (http://python-history.blogspot.com/2010/08/why-pythons-integer-division-floors.html).
+	// This way indexing negative indexes will count from the back
+	// of the array.
+	length := a_value.Len()
+	idx = (idx%length + length) % length
 	return a_value.Index(idx).Interface(), true
 }
 
 func (self _IndexAssociativeProtocol) GetMembers(
-	scope *vfilter.Scope, a vfilter.Any) []string {
+	scope vfilter.Scope, a vfilter.Any) []string {
 	return []string{}
 }
 
 func init() {
 	vql_subsystem.RegisterFunction(&ParseJsonFunction{})
 	vql_subsystem.RegisterFunction(&ParseJsonArray{})
+	vql_subsystem.RegisterProtocol(&_nilAssociativeProtocol{})
 	vql_subsystem.RegisterProtocol(&_MapInterfaceAssociativeProtocol{})
 	vql_subsystem.RegisterProtocol(&_ProtobufAssociativeProtocol{})
 	vql_subsystem.RegisterProtocol(&_IndexAssociativeProtocol{})
+	vql_subsystem.RegisterPlugin(&ParseJsonArrayPlugin{})
+	vql_subsystem.RegisterPlugin(&ParseJsonlPlugin{})
 }

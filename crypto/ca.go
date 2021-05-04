@@ -25,11 +25,13 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"math/big"
+	"net"
 	"time"
 
 	errors "github.com/pkg/errors"
-	api_proto "www.velocidex.com/golang/velociraptor/api/proto"
-	logging "www.velocidex.com/golang/velociraptor/logging"
+	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
+	"www.velocidex.com/golang/velociraptor/crypto/utils"
+	crypto_utils "www.velocidex.com/golang/velociraptor/crypto/utils"
 )
 
 type CertBundle struct {
@@ -43,8 +45,12 @@ func GenerateCACert(rsaBits int) (*CertBundle, error) {
 		return nil, err
 	}
 
+	// Velociraptor depends on the CA certificate for
+	// everything. It is embedded in clients and underpins
+	// comms. We must ensure it does not expire in a reasonable
+	// time.
 	start_time := time.Now()
-	end_time := start_time.Add(365 * 24 * time.Hour)
+	end_time := start_time.Add(10 * 365 * 24 * time.Hour) // 10 years
 
 	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
 	serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
@@ -97,7 +103,10 @@ func GenerateCACert(rsaBits int) (*CertBundle, error) {
 	}, nil
 }
 
-func GenerateServerCert(config_obj *api_proto.Config, name string) (*CertBundle, error) {
+func GenerateServerCert(config_obj *config_proto.Config, name string) (*CertBundle, error) {
+	if config_obj.CA == nil {
+		return nil, errors.New("No CA configured.")
+	}
 	priv, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		return nil, err
@@ -106,29 +115,26 @@ func GenerateServerCert(config_obj *api_proto.Config, name string) (*CertBundle,
 	start_time := time.Now()
 	end_time := start_time.Add(365 * 24 * time.Hour)
 
-	serial_number := big.NewInt(1)
-	old_cert, err := ParseX509CertFromPemStr([]byte(
-		config_obj.Frontend.Certificate))
-	if err == nil {
-		serial_number.Add(serial_number, old_cert.SerialNumber)
-		logging.GetLogger(config_obj, &logging.FrontendComponent).Info(
-			"Incremented server serial number to %v", serial_number)
+	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
+	serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
+	if err != nil {
+		return nil, err
 	}
 
-	ca_cert, err := ParseX509CertFromPemStr([]byte(
+	ca_cert, err := utils.ParseX509CertFromPemStr([]byte(
 		config_obj.Client.CaCertificate))
 	if err != nil {
 		return nil, err
 	}
 
-	ca_private_key, err := parseRsaPrivateKeyFromPemStr(
+	ca_private_key, err := utils.ParseRsaPrivateKeyFromPemStr(
 		[]byte(config_obj.CA.PrivateKey))
 	if err != nil {
 		return nil, err
 	}
 
 	template := x509.Certificate{
-		SerialNumber: serial_number,
+		SerialNumber: serialNumber,
 		Subject: pkix.Name{
 			CommonName:   name,
 			Organization: []string{"Velociraptor"},
@@ -145,8 +151,99 @@ func GenerateServerCert(config_obj *api_proto.Config, name string) (*CertBundle,
 		BasicConstraintsValid: true,
 	}
 
+	// Encode the common name in the DNSNames field. Note that by
+	// default Velociraptor pins the server name to
+	// VelociraptorServer - it is not a DNS name at all. But since
+	// golang 1.15 has deprecated the CommonName we need to use
+	// this field or it will refuse to connect.
+	// See https://github.com/golang/go/issues/39568#issuecomment-671424481
+	ip := net.ParseIP(name)
+	if ip != nil {
+		template.IPAddresses = append(template.IPAddresses, ip)
+	} else {
+		template.DNSNames = append(template.DNSNames, name)
+	}
+
 	derBytes, err := x509.CreateCertificate(
 		rand.Reader, &template, ca_cert,
+		&priv.PublicKey,
+		ca_private_key)
+
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	return &CertBundle{
+		PrivateKey: string(pem.EncodeToMemory(
+			&pem.Block{
+				Type:  "RSA PRIVATE KEY",
+				Bytes: x509.MarshalPKCS1PrivateKey(priv),
+			},
+		)),
+		Cert: string(pem.EncodeToMemory(
+			&pem.Block{
+				Type:  "CERTIFICATE",
+				Bytes: derBytes,
+			},
+		)),
+	}, nil
+}
+
+// Repack the same certificate. This does not change the key and is
+// needed to work around an issue with Go 1.15 no longer supporting
+// certs without SAN.
+func ReissueServerCert(config_obj *config_proto.Config,
+	old_cert_pem, private_pem string) (*CertBundle, error) {
+	if config_obj.CA == nil {
+		return nil, errors.New("No CA configured.")
+	}
+
+	priv, err := crypto_utils.ParseRsaPrivateKeyFromPemStr([]byte(private_pem))
+	if err != nil {
+		return nil, err
+	}
+
+	template, err := crypto_utils.ParseX509CertFromPemStr([]byte(old_cert_pem))
+	if err != nil {
+		return nil, err
+	}
+
+	template.NotBefore = time.Now()
+	template.NotAfter = template.NotBefore.Add(365 * 24 * time.Hour)
+
+	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
+	template.SerialNumber, err = rand.Int(rand.Reader, serialNumberLimit)
+	if err != nil {
+		return nil, err
+	}
+
+	ca_cert, err := utils.ParseX509CertFromPemStr([]byte(
+		config_obj.Client.CaCertificate))
+	if err != nil {
+		return nil, err
+	}
+
+	ca_private_key, err := utils.ParseRsaPrivateKeyFromPemStr(
+		[]byte(config_obj.CA.PrivateKey))
+	if err != nil {
+		return nil, err
+	}
+
+	// Encode the common name in the DNSNames field. Note that by
+	// default Velociraptor pins the server name to
+	// VelociraptorServer - it is not a DNS name at all. But since
+	// golang 1.15 has deprecated the CommonName we need to use
+	// this field or it will refuse to connect.
+	// See https://github.com/golang/go/issues/39568#issuecomment-671424481
+	ip := net.ParseIP(template.Subject.CommonName)
+	if ip != nil {
+		template.IPAddresses = append(template.IPAddresses, ip)
+	} else {
+		template.DNSNames = append(template.DNSNames, template.Subject.CommonName)
+	}
+
+	derBytes, err := x509.CreateCertificate(
+		rand.Reader, template, ca_cert,
 		&priv.PublicKey,
 		ca_private_key)
 

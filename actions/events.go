@@ -28,11 +28,13 @@ package actions
 
 import (
 	"context"
+	"fmt"
 	"sync"
 
+	"google.golang.org/protobuf/proto"
 	actions_proto "www.velocidex.com/golang/velociraptor/actions/proto"
-	api_proto "www.velocidex.com/golang/velociraptor/api/proto"
-	crypto_proto "www.velocidex.com/golang/velociraptor/crypto/proto"
+	config "www.velocidex.com/golang/velociraptor/config"
+	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/logging"
 	"www.velocidex.com/golang/velociraptor/responder"
 )
@@ -46,9 +48,52 @@ type EventTable struct {
 	Events  []*actions_proto.VQLCollectorArgs
 	version uint64
 
-	// This will be closed to signal we need to abort the current
-	// event queries.
+	config_obj *config_proto.Config
+
+	// This will be closed to signal that we need to abort the
+	// current event queries.
 	Done chan bool
+	wg   sync.WaitGroup
+}
+
+func (self *EventTable) equal(events []*actions_proto.VQLCollectorArgs) bool {
+	if len(events) != len(self.Events) {
+		return false
+	}
+
+	for i := range self.Events {
+		lhs := self.Events[i]
+		rhs := events[i]
+
+		if len(lhs.Query) != len(rhs.Query) {
+			return false
+		}
+
+		for j := range lhs.Query {
+			if !proto.Equal(lhs.Query[j], rhs.Query[j]) {
+				return false
+			}
+		}
+
+		if len(lhs.Env) != len(rhs.Env) {
+			return false
+		}
+
+		for j := range lhs.Env {
+			if !proto.Equal(lhs.Env[j], rhs.Env[j]) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func (self *EventTable) Close() {
+	logger := logging.GetLogger(self.config_obj, &logging.ClientComponent)
+	logger.Info("Closing EventTable\n")
+
+	close(self.Done)
+	self.wg.Wait()
 }
 
 func GlobalEventTableVersion() uint64 {
@@ -59,30 +104,52 @@ func GlobalEventTableVersion() uint64 {
 }
 
 func update(
+	config_obj *config_proto.Config,
 	responder *responder.Responder,
-	table *actions_proto.VQLEventTable) (*EventTable, error) {
+	table *actions_proto.VQLEventTable) (*EventTable, error, bool) {
 
 	mu.Lock()
 	defer mu.Unlock()
 
+	// Only update the event table if we need to.
+	if table.Version <= GlobalEventTable.version {
+		return GlobalEventTable, nil, false
+	}
+
+	// If the new update is identical to the old queries we wont
+	// restart. This can happen e.g. if the server changes label
+	// groups and recaculates the table version but the actual
+	// queries dont end up changing.
+	if GlobalEventTable.equal(table.Event) {
+		logger := logging.GetLogger(config_obj, &logging.ClientComponent)
+		logger.Info("Client event query update %v did not "+
+			"change queries, skipping", table.Version)
+
+		// Update the version only but keep queries the same.
+		GlobalEventTable.version = table.Version
+		return GlobalEventTable, nil, false
+	}
+
 	// Close the old table.
 	if GlobalEventTable.Done != nil {
-		close(GlobalEventTable.Done)
+		GlobalEventTable.Close()
 	}
 
 	// Make a new table.
-	GlobalEventTable = NewEventTable(responder, table)
+	GlobalEventTable = NewEventTable(config_obj, responder, table)
 
-	return GlobalEventTable, nil
+	return GlobalEventTable, nil, true /* changed */
 }
 
 func NewEventTable(
+	config_obj *config_proto.Config,
 	responder *responder.Responder,
 	table *actions_proto.VQLEventTable) *EventTable {
 	result := &EventTable{
-		Events:  table.Event,
-		version: table.Version,
-		Done:    make(chan bool),
+		Events:     table.Event,
+		version:    table.Version,
+		Done:       make(chan bool),
+		config_obj: config_obj,
 	}
 
 	return result
@@ -90,23 +157,34 @@ func NewEventTable(
 
 type UpdateEventTable struct{}
 
-func (self *UpdateEventTable) Run(
-	config *api_proto.Config,
+func (self UpdateEventTable) Run(
+	config_obj *config_proto.Config,
 	ctx context.Context,
-	msg *crypto_proto.GrrMessage,
-	output chan<- *crypto_proto.GrrMessage) {
-	responder := responder.NewResponder(msg, output)
-	arg, pres := responder.GetArgs().(*actions_proto.VQLEventTable)
-	if !pres {
-		responder.RaiseError("Request should be of type VQLEventTable")
+	responder *responder.Responder,
+	arg *actions_proto.VQLEventTable) {
+
+	// Make a new table.
+	table, err, changed := update(config_obj, responder, arg)
+	if err != nil {
+		responder.RaiseError(ctx, fmt.Sprintf(
+			"Error updating global event table: %v", err))
 		return
 	}
 
-	// Make a new table.
-	table, err := update(responder, arg)
-	if err != nil {
-		responder.Log("Error updating global event table: %v", err)
+	// No change required, skip it.
+	if !changed {
+		// We still need to write the new version
+		err = update_writeback(config_obj, arg)
+		if err != nil {
+			responder.RaiseError(ctx, fmt.Sprintf(
+				"Unable to write events to writeback: %v", err))
+		} else {
+			responder.Return(ctx)
+		}
+		return
 	}
+
+	logger := logging.GetLogger(config_obj, &logging.ClientComponent)
 
 	// Make a context for the VQL query.
 	new_ctx, cancel := context.WithCancel(context.Background())
@@ -114,20 +192,21 @@ func (self *UpdateEventTable) Run(
 	// Cancel the context when the cancel channel is closed.
 	go func() {
 		<-table.Done
+		logger.Info("UpdateEventTable: Closing all contexts")
 		cancel()
 	}()
 
-	logger := logging.GetLogger(config, &logging.ClientComponent)
-
 	// Start a new query for each event.
 	action_obj := &VQLClientAction{}
-	var wg sync.WaitGroup
-	wg.Add(len(table.Events))
+	table.wg.Add(len(table.Events))
 
 	for _, event := range table.Events {
-		go func(event *actions_proto.VQLCollectorArgs) {
-			defer wg.Done()
+		query_responder := responder.Copy()
 
+		go func(event *actions_proto.VQLCollectorArgs) {
+			defer table.wg.Done()
+
+			// Name of the query we are running.
 			name := ""
 			for _, q := range event.Query {
 				if q.Name != "" {
@@ -135,20 +214,48 @@ func (self *UpdateEventTable) Run(
 				}
 			}
 
-			logger.Info("Starting %s", name)
-			action_obj.StartQuery(
-				config, new_ctx, responder, event)
+			if name != "" {
+				logger.Info("<green>Starting</> monitoring query %s", name)
+			}
+			query_responder.Artifact = name
 
-			logger.Info("Finished %s", name)
+			// Event tables never time out
+			if event.Timeout == 0 {
+				event.Timeout = 99999999
+			}
+
+			// Dont heartbeat too often for event queries
+			// - the log generates un-neccesary traffic.
+			if event.Heartbeat == 0 {
+				event.Heartbeat = 300 // 5 minutes
+			}
+
+			action_obj.StartQuery(
+				config_obj, new_ctx, query_responder, event)
+			if name != "" {
+				logger.Info("Finished monitoring query %s", name)
+			}
 		}(event)
 	}
 
-	// Return an OK status. This is needed to make sure the
-	// request is de-queued.
-	responder.Return()
+	err = update_writeback(config_obj, arg)
+	if err != nil {
+		responder.RaiseError(ctx, fmt.Sprintf(
+			"Unable to write events to writeback: %v", err))
+		return
+	}
 
-	// Wait here for all queries to finish - this forces the
-	// output channel to be open and allows us to write results to
-	// the server.
-	wg.Wait()
+	responder.Return(ctx)
+}
+
+func update_writeback(
+	config_obj *config_proto.Config,
+	event_table *actions_proto.VQLEventTable) error {
+
+	// Store the event table in the Writeback file.
+	config_copy := proto.Clone(config_obj).(*config_proto.Config)
+	event_copy := proto.Clone(event_table).(*actions_proto.VQLEventTable)
+	config_copy.Writeback.EventQueries = event_copy
+
+	return config.UpdateWriteback(config_copy)
 }

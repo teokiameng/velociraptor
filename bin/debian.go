@@ -1,3 +1,5 @@
+// +build !aix
+
 // This command creates a customized server deb package which may be
 // used to automatically deploy Velociraptor server (e.g. in a Docker
 // container or on its own VM). The intention is to make this as self
@@ -14,6 +16,9 @@
 
 // Invoke by:
 // velociraptor --config server.config.yaml debian server
+
+// Additionally the "debian client" command will create a similar deb
+// package with the client configuration.
 
 /*
    Velociraptor - Hunting Evil
@@ -35,18 +40,15 @@
 package main
 
 import (
-	"archive/tar"
-	"compress/gzip"
 	"encoding/binary"
 	"fmt"
-	"io"
-	"io/ioutil"
 	"os"
-	"path"
 
-	"github.com/Velocidex/yaml"
+	"github.com/Velocidex/yaml/v2"
 	"github.com/xor-gate/debpkg"
 	kingpin "gopkg.in/alecthomas/kingpin.v2"
+	"www.velocidex.com/golang/velociraptor/config"
+	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/constants"
 )
 
@@ -62,13 +64,21 @@ var (
 		fmt.Sprintf("velociraptor_%s_server.deb", constants.VERSION)).
 		String()
 
-	server_debian_command_with_monitoring = server_debian_command.Flag(
-		"with_monitoring", "Also include Grafana and Prometheus").Bool()
-
 	server_debian_command_binary = server_debian_command.Flag(
 		"binary", "The binary to package").String()
 
-	service_definition = `
+	client_debian_command = debian_command.Command(
+		"client", "Create a client package from a client config file.")
+
+	client_debian_command_output = client_debian_command.Flag(
+		"output", "Filename to output").Default(
+		fmt.Sprintf("velociraptor_%s_client.deb", constants.VERSION)).
+		String()
+
+	client_debian_command_binary = client_debian_command.Flag(
+		"binary", "The binary to package").String()
+
+	server_service_definition = `
 [Unit]
 Description=Velociraptor linux amd64
 After=syslog.target network.target
@@ -80,13 +90,25 @@ RestartSec=120
 LimitNOFILE=20000
 Environment=LANG=en_US.UTF-8
 ExecStart=%s --config %s frontend
+User=velociraptor
+Group=velociraptor
 
 [Install]
 WantedBy=multi-user.target
 `
-	prometheus_service_definition = `
+
+	server_launcher = `#!/bin/bash
+
+export VELOCIRAPTOR_CONFIG=/etc/velociraptor/server.config.yaml
+if ! [[ -r "$VELOCIRAPTOR_CONFIG" ]] ; then
+    echo "'$VELOCIRAPTOR_CONFIG' is not readable, you will need to run this as the velociraptor user ('sudo -u velociraptor bash')."
+else
+    /usr/local/bin/velociraptor.bin "$@"
+fi
+`
+	client_service_definition = `
 [Unit]
-Description=Velociraptor prometheus service
+Description=Velociraptor linux client
 After=syslog.target network.target
 
 [Service]
@@ -95,24 +117,7 @@ Restart=always
 RestartSec=120
 LimitNOFILE=20000
 Environment=LANG=en_US.UTF-8
-ExecStart=/usr/share/velociraptor_server/%s --config.file /etc/velociraptor/prometheus_velo.yaml
-
-[Install]
-WantedBy=multi-user.target
-`
-	grafana_service_definition = `
-[Unit]
-Description=Velociraptor Grafana
-After=syslog.target network.target
-
-[Service]
-Type=simple
-Restart=always
-RestartSec=120
-LimitNOFILE=20000
-Environment=LANG=en_US.UTF-8
-ExecStart=/usr/share/velociraptor_server/%s
-WorkingDirectory=/usr/share/velociraptor_server/%s
+ExecStart=%s --config %s client
 
 [Install]
 WantedBy=multi-user.target
@@ -120,8 +125,16 @@ WantedBy=multi-user.target
 )
 
 func doServerDeb() {
-	config_obj, err := get_server_config(*config_path)
+	// Disable logging when creating a deb - we may not create the
+	// deb on the same system where the logs should go.
+	_ = config.ValidateClientConfig(&config_proto.Config{})
+
+	config_obj, err := DefaultConfigLoader.WithRequiredFrontend().LoadAndValidate()
 	kingpin.FatalIfError(err, "Unable to load config file")
+
+	// Debian packages always use the "velociraptor" user.
+	config_obj.Frontend.RunAsUser = "velociraptor"
+	config_obj.ServerType = "linux"
 
 	res, err := yaml.Marshal(config_obj)
 	kingpin.FatalIfError(err, "marshal")
@@ -138,7 +151,9 @@ func doServerDeb() {
 	defer fd.Close()
 
 	header := make([]byte, 4)
-	fd.Read(header)
+	_, err = fd.Read(header)
+	kingpin.FatalIfError(err, "Unable to read header")
+
 	if binary.LittleEndian.Uint32(header) != 0x464c457f {
 		kingpin.Fatalf("Binary does not appear to be an " +
 			"ELF binary. Please specify the linux binary " +
@@ -153,147 +168,130 @@ func doServerDeb() {
 	deb.SetArchitecture("amd64")
 	deb.SetMaintainer("Velocidex Innovations")
 	deb.SetMaintainerEmail("support@velocidex.com")
-	deb.SetHomepage("https://docs.velociraptor.velocidex.com")
+	deb.SetHomepage("https://www.velocidex.com/docs")
 	deb.SetShortDescription("Velociraptor server deployment.")
+	deb.SetDepends("libcap2-bin, systemd")
 
 	config_path := "/etc/velociraptor/server.config.yaml"
 	velociraptor_bin := "/usr/local/bin/velociraptor"
 
-	deb.AddFileString(string(res), config_path)
-	deb.AddFileString(fmt.Sprintf(service_definition, velociraptor_bin, config_path),
+	err = deb.AddFileString(string(res), config_path)
+	kingpin.FatalIfError(err, "Adding file")
+	err = deb.AddFileString(fmt.Sprintf(
+		server_service_definition, velociraptor_bin, config_path),
 		"/etc/systemd/system/velociraptor_server.service")
-	deb.AddFile(input, velociraptor_bin)
+	kingpin.FatalIfError(err, "Adding file")
+	err = deb.AddFile(input, velociraptor_bin+".bin")
+	kingpin.FatalIfError(err, "Adding file")
+	err = deb.AddFileString(server_launcher, velociraptor_bin)
+	kingpin.FatalIfError(err, "Adding file")
 
-	// Just a simple bare bones deb.
-	if !*server_debian_command_with_monitoring {
-		deb.AddControlExtraString("postinst", `
+	filestore_path := config_obj.Datastore.Location
+	err = deb.AddControlExtraString("postinst", fmt.Sprintf(`
+if ! getent group velociraptor >/dev/null; then
+   addgroup --system velociraptor
+fi
+
+if ! getent passwd velociraptor >/dev/null; then
+   adduser --system --home /etc/velociraptor/ --no-create-home \
+     --ingroup velociraptor velociraptor --shell /bin/false \
+     --gecos "Velociraptor Server"
+fi
+
+# Make the filestore path accessible to the user.
+mkdir -p '%s'
+chown -R velociraptor:velociraptor '%s' /etc/velociraptor/
+chmod -R go-r /etc/velociraptor/
+chmod o+x /usr/local/bin/velociraptor /usr/local/bin/velociraptor.bin
+
+setcap CAP_SYS_RESOURCE,CAP_NET_BIND_SERVICE=+eip /usr/local/bin/velociraptor.bin
 /bin/systemctl enable velociraptor_server
 /bin/systemctl start velociraptor_server
-`)
+`, filestore_path, filestore_path))
+	kingpin.FatalIfError(err, "Adding file")
 
-		deb.AddControlExtraString("prerm", `
+	err = deb.AddControlExtraString("prerm", `
 /bin/systemctl disable velociraptor_server
 /bin/systemctl stop velociraptor_server
 `)
-		err = deb.Write(*server_debian_command_output)
-		kingpin.FatalIfError(err, "Deb write")
-
-		return
-	}
-
-	// Copy the graphana and prometheus distributions into the deb
-	// so we are self contained.
-	err = include_package(
-		"https://dl.grafana.com/oss/release/grafana-6.1.3.linux-amd64.tar.gz",
-		"/usr/share/velociraptor_server/", deb)
-	kingpin.FatalIfError(err, "Downloading Grafana")
-
-	deb.AddFileString(fmt.Sprintf(grafana_service_definition,
-		"grafana-6.1.3/bin/grafana-server", "grafana-6.1.3/"),
-		"/etc/systemd/system/velociraptor_grafana.service")
-
-	err = include_package(
-		"https://github.com/prometheus/prometheus/releases/download/v2.9.0/prometheus-2.9.0.linux-amd64.tar.gz",
-		"/usr/share/velociraptor_server/", deb)
-	kingpin.FatalIfError(err, "Downloading Prometheus")
-
-	deb.AddFileString(fmt.Sprintf(prometheus_service_definition, "prometheus-2.9.0.linux-amd64/prometheus"),
-		"/etc/systemd/system/velociraptor_prometheus.service")
-
-	deb.AddFileString(`
-global:
-  scrape_interval:     5s
-
-scrape_configs:
-  - job_name: 'velociraptor'
-    static_configs:
-      - targets: ['localhost:8003']
-`, "/etc/velociraptor/prometheus_velo.yaml")
-
-	deb.AddControlExtraString("postinst", `
-/bin/chmod +x /usr/share/velociraptor_server/*/bin/grafana-server /usr/share/velociraptor_server/*/prometheus
-
-/bin/systemctl enable velociraptor_server
-/bin/systemctl start velociraptor_server
-
-/bin/systemctl enable velociraptor_grafana
-/bin/systemctl start velociraptor_grafana
-
-/bin/systemctl enable velociraptor_prometheus
-/bin/systemctl start velociraptor_prometheus
-
-`)
-
-	deb.AddControlExtraString("prerm", `
-/bin/systemctl disable velociraptor_server
-/bin/systemctl stop velociraptor_server
-
-/bin/systemctl disable velociraptor_grafana
-/bin/systemctl stop velociraptor_grafana
-
-/bin/systemctl disable velociraptor_prometheus
-/bin/systemctl stop velociraptor_prometheus
-
-`)
+	kingpin.FatalIfError(err, "Adding file")
 
 	err = deb.Write(*server_debian_command_output)
 	kingpin.FatalIfError(err, "Deb write")
 }
 
-// Download a tar/gz and unpack it into the deb package.
-func include_package(url, deb_path string, deb *debpkg.DebPkg) error {
-	filename := path.Base(url)
-	fd, err := os.Open(filename)
-	if os.IsNotExist(err) {
-		err = DownloadFile(filename, url)
-		if err != nil {
-			return err
-		}
+func doClientDeb() {
+	// Disable logging when creating a deb - we may not create the
+	// deb on the same system where the logs should go.
+	_ = config.ValidateClientConfig(&config_proto.Config{})
 
-		fd, err = os.Open(filename)
+	config_obj, err := DefaultConfigLoader.
+		WithRequiredClient().LoadAndValidate()
+	kingpin.FatalIfError(err, "Unable to load config file")
+
+	res, err := yaml.Marshal(getClientConfig(config_obj))
+	kingpin.FatalIfError(err, "marshal")
+
+	input := *client_debian_command_binary
+
+	if input == "" {
+		input, err = os.Executable()
+		kingpin.FatalIfError(err, "Unable to open executable")
 	}
 
-	if err != nil {
-		return err
-	}
+	fd, err := os.Open(input)
+	kingpin.FatalIfError(err, "Unable to open executable")
 	defer fd.Close()
 
-	gzf, err := gzip.NewReader(fd)
-	if err != nil {
-		return err
+	header := make([]byte, 4)
+	_, err = fd.Read(header)
+	kingpin.FatalIfError(err, "Unable to open executable")
+
+	if binary.LittleEndian.Uint32(header) != 0x464c457f {
+		kingpin.Fatalf("Binary does not appear to be an " +
+			"ELF binary. Please specify the linux binary " +
+			"using the --binary flag.")
 	}
 
-	tarReader := tar.NewReader(gzf)
+	deb := debpkg.New()
+	defer deb.Close()
 
-	i := 0
-	for {
-		header, err := tarReader.Next()
-		if err == io.EOF {
-			break
-		}
+	deb.SetName("velociraptor-client")
+	deb.SetVersion(constants.VERSION)
+	deb.SetArchitecture("amd64")
+	deb.SetMaintainer("Velocidex Innovations")
+	deb.SetMaintainerEmail("support@velocidex.com")
+	deb.SetHomepage("https://www.velocidex.com")
+	deb.SetShortDescription("Velociraptor client package.")
 
-		if err != nil {
-			return err
-		}
+	config_path := "/etc/velociraptor/client.config.yaml"
+	velociraptor_bin := "/usr/local/bin/velociraptor_client"
 
-		if header.Typeflag == tar.TypeReg {
-			// This is not ideal but debpkg does not
-			// support streamed readers.
-			buffer, err := ioutil.ReadAll(tarReader)
-			if err != nil {
-				return err
-			}
+	err = deb.AddFileString(string(res), config_path)
+	kingpin.FatalIfError(err, "Deb write")
 
-			name := path.Join(deb_path, header.Name)
+	err = deb.AddFileString(fmt.Sprintf(
+		client_service_definition, velociraptor_bin, config_path),
+		"/etc/systemd/system/velociraptor_client.service")
+	kingpin.FatalIfError(err, "Deb write")
 
-			fmt.Println("(", i, ")", "Name: ", name)
-			deb.AddFileString(string(buffer), name)
-		}
+	err = deb.AddFile(input, velociraptor_bin)
+	kingpin.FatalIfError(err, "Deb write")
 
-		i++
-	}
+	err = deb.AddControlExtraString("postinst", `
+/bin/systemctl enable velociraptor_client
+/bin/systemctl start velociraptor_client
+`)
+	kingpin.FatalIfError(err, "Deb write")
 
-	return nil
+	err = deb.AddControlExtraString("prerm", `
+/bin/systemctl disable velociraptor_client
+/bin/systemctl stop velociraptor_client
+`)
+	kingpin.FatalIfError(err, "Deb write")
+
+	err = deb.Write(*client_debian_command_output)
+	kingpin.FatalIfError(err, "Deb write")
 }
 
 func init() {
@@ -301,6 +299,9 @@ func init() {
 		switch command {
 		case server_debian_command.FullCommand():
 			doServerDeb()
+
+		case client_debian_command.FullCommand():
+			doClientDeb()
 
 		default:
 			return false

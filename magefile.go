@@ -25,6 +25,7 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -35,156 +36,309 @@ import (
 
 var (
 	assets = map[string]string{
-		"artifacts/b0x.yaml": "artifacts/assets/ab0x.go",
-		"config/b0x.yaml":    "config/ab0x.go",
-		"gui/b0x.yaml":       "gui/assets/ab0x.go",
+		"artifacts/b0x.yaml":        "artifacts/assets/ab0x.go",
+		"config/b0x.yaml":           "config/ab0x.go",
+		"gui/velociraptor/b0x.yaml": "gui/velociraptor/ab0x.go",
 	}
 
+	// apt-get install gcc-mingw-w64-x86-64
 	mingw_xcompiler = "x86_64-w64-mingw32-gcc"
-	name            = "velociraptor"
-	version         = "v" + constants.VERSION
+
+	// apt-get install gcc-mingw-w64
+	mingw_xcompiler_32 = "i686-w64-mingw32-gcc"
+	name               = "velociraptor"
+	version            = "v" + constants.VERSION
+	base_tags          = " server_vql extras "
 )
 
-func Xgo() error {
-	return sh.RunV(
-		"xgo", "-out", filepath.Join("output", "velociraptor-"+version), "-v",
-		"--targets", "windows/*,darwin/amd64,linux/amd64",
-		"-tags", "release cgo",
-		"-go", "1.11",
-		"-ldflags=-s -w "+flags(),
-		"./bin/")
+type Builder struct {
+	goos        string
+	arch        string
+	extension   string
+	extra_tags  string
+	extra_flags []string
+
+	disable_cgo bool
+
+	// Set to override the output filename.
+	filename string
 }
 
-func WindowsRace() error {
-	return sh.RunV(
-		"xgo", "-out", filepath.Join("output", "velociraptor-"+version), "-v",
-		"--targets", "windows/amd64",
-		"-go", "1.11",
-		"-tags", "release cgo", "-race",
-		"-ldflags=-s -w "+flags(),
-		"./bin/")
+func (self *Builder) Name() string {
+	if self.filename != "" {
+		return self.filename
+	}
+
+	if self.goos == "windows" {
+		self.extension = ".exe"
+	}
+
+	name := fmt.Sprintf("%s-%s-%s-%s%s",
+		name, version,
+		self.goos,
+		self.arch,
+		self.extension)
+
+	if self.disable_cgo {
+		name += "-nocgo"
+	}
+
+	return name
 }
 
-func Linux() error {
+func (self *Builder) Env() map[string]string {
+	env := make(map[string]string)
+
+	env["GOOS"] = self.goos
+	env["GOARCH"] = self.arch
+
+	if self.disable_cgo {
+		env["CGO_ENABLED"] = "0"
+	} else {
+		env["CGO_ENABLED"] = "1"
+	}
+
+	// If we are cross compiling, set the right compiler.
+	if (runtime.GOOS == "linux" || runtime.GOOS == "darwin") &&
+		self.goos == "windows" {
+
+		if self.arch == "amd64" {
+			if mingwxcompiler_exists() {
+				env["CC"] = mingw_xcompiler
+			}
+		} else {
+			if mingwxcompiler32_exists() {
+				env["CC"] = mingw_xcompiler_32
+			}
+		}
+	}
+
+	return env
+}
+
+// Make sure the correct version of the syso file is present. If we
+// are building for non windows platforms we need to remove it
+// completely.
+func (self Builder) ensureSyso() error {
+	sh.Rm("bin/rsrc.syso")
+
+	if self.goos == "windows" {
+		switch self.arch {
+		case "386":
+			err := sh.Copy("bin/rsrc.syso", "docs/rsrc_386.syso")
+			if err != nil {
+				return err
+			}
+		case "amd64":
+			err := sh.Copy("bin/rsrc.syso", "docs/rsrc_amd64.syso")
+			if err != nil {
+				return err
+			}
+
+		}
+	}
+
+	return nil
+}
+
+func (self Builder) Run() error {
 	if err := os.Mkdir("output", 0700); err != nil && !os.IsExist(err) {
 		return fmt.Errorf("failed to create output: %v", err)
 	}
+
+	self.ensureSyso()
 
 	err := ensure_assets()
 	if err != nil {
 		return err
 	}
 
-	env := make(map[string]string)
-	err = sh.RunWith(
-		env,
-		mg.GoCmd(), "build",
-		"-o", filepath.Join("output", name),
-		"-tags", "release",
-		"-ldflags=-s -w "+flags(),
-		"./bin/")
-
-	if err != nil {
-		return err
+	tags := base_tags + self.extra_tags
+	args := []string{
+		"build",
+		"-o", filepath.Join("output", self.Name()),
+		"-tags", tags,
+		"-ldflags=-s -w " + flags(),
 	}
+	args = append(args, self.extra_flags...)
+	args = append(args, "./bin/")
 
-	return err
+	return sh.RunWith(self.Env(), mg.GoCmd(), args...)
 }
 
-// Builds a Development binary. This does not embed things like GUI
-// resources to allow them to be loaded from the local directory.
-func Dev() error {
-	if err := os.Mkdir("output", 0700); err != nil && !os.IsExist(err) {
-		return fmt.Errorf("failed to create output: %v", err)
-	}
-
-	err := ensure_assets()
-	if err != nil {
-		return err
-	}
-
-	env := make(map[string]string)
-	err = sh.RunWith(
-		env,
-		mg.GoCmd(), "build", "-race",
-		"-o", filepath.Join("output", name),
-		"-tags", "devel",
-		"-ldflags=-s -w "+flags(),
-		"./bin/")
-
-	if err != nil {
-		return err
-	}
-
-	return err
+func Auto() error {
+	return Builder{goos: runtime.GOOS,
+		filename:   "velociraptor",
+		extra_tags: " release yara ",
+		arch:       runtime.GOARCH}.Run()
 }
 
-// Build step for Appveyor.
-func Appveyor() error {
-	// Appveyor can cache the vendor directory in which case we do
-	// not need to run dep ensure at all. If the toml file is
-	// changed though it wont do it and we end up with an empty
-	// vendor directory.
-	files, err := ioutil.ReadDir("vendor")
-	fmt.Printf("Directory vendor: %v (%v files)\n", err, len(files))
-	if err != nil || len(files) == 0 {
-		sh.RunV("go", "get", "github.com/golang/dep")
-		sh.RunV("go", "get", "-u", "github.com/golang/dep/cmd/dep")
-		sh.RunV("dep", "ensure")
+func AutoDev() error {
+	return Builder{goos: runtime.GOOS,
+		arch:        runtime.GOARCH,
+		extra_tags:  " yara ",
+		filename:    "velociraptor",
+		extra_flags: []string{"-race"}}.Run()
+}
+
+// Build all the release versions. Darwin we build separately on a
+// Mac.
+func Release() error {
+	err := Clean()
+	if err != nil {
+		return err
+	}
+
+	err = build_gui_files()
+	if err != nil {
+		return err
+	}
+
+	if runtime.GOOS == "linux" {
+		err := Linux()
+		if err != nil {
+			return err
+		}
+
+		if mingwxcompiler_exists() {
+			err := Windows()
+			if err != nil {
+				return err
+			}
+			return Windowsx86()
+		}
+	}
+
+	if runtime.GOOS == "darwin" {
+		return Darwin()
 	}
 
 	return Windows()
 }
 
-// Cross compile the windows binary using mingw. Note that this does
-// not run the race detector because the ubuntu distribution of mingw
-// does not include tsan. Use WindowsRace() to build with xgo.
-func Windows() error {
-	if err := os.Mkdir("output", 0700); err != nil && !os.IsExist(err) {
-		return fmt.Errorf("failed to create output: %v", err)
-	}
-
-	err := ensure_assets()
-	if err != nil {
-		return err
-	}
-
-	env := make(map[string]string)
-	if mingwxcompiler_exists() {
-		env["CC"] = mingw_xcompiler
-		env["CGO_ENABLED"] = "1"
-	} else {
-		fmt.Printf("Windows cross compiler not found. Disabling cgo modules.")
-		env["CGO_ENABLED"] = "0"
-	}
-
-	env["GOOS"] = "windows"
-	env["GOARCH"] = "amd64"
-
-	err = sh.RunWith(
-		env,
-		mg.GoCmd(), "build",
-		"-o", filepath.Join("output", name+".exe"),
-		"-tags", "release",
-		"-ldflags=-s -w "+flags(),
-		"./bin/")
-
-	if err != nil {
-		return err
-	}
-
-	return err
+func Linux() error {
+	return Builder{
+		extra_tags: " release yara ",
+		goos:       "linux",
+		arch:       "amd64"}.Run()
 }
 
-// We have to compile darwin executables with xgo otherwise many of
-// the cgo plugins wont work.
+func Freebsd() error {
+	return Builder{
+		extra_tags: " release yara ",
+		goos:       "freebsd",
+
+		// When building on actual freebsd we should have c
+		// compilers, otherwise disable cgo.
+		disable_cgo: runtime.GOOS != "freebsd",
+		arch:        "amd64"}.Run()
+}
+
+func Aix() error {
+	return Builder{
+		extra_tags:  " release yara ",
+		goos:        "aix",
+		disable_cgo: true,
+		arch:        "ppc64",
+	}.Run()
+}
+
+func Arm() error {
+	return Builder{
+		extra_tags:  " release yara ",
+		goos:        "linux",
+		disable_cgo: true,
+		arch:        "arm",
+	}.Run()
+}
+
+// Builds a Development binary. This does not embed things like GUI
+// resources to allow them to be loaded from the local directory.
+func Dev() error {
+	return Builder{goos: "linux", arch: "amd64",
+		extra_flags: []string{"-race"}}.Run()
+}
+
+// Cross compile the windows binary using mingw. Note that this does
+// not run the race detector because the ubuntu distribution of mingw
+// does not include tsan.
+func Windows() error {
+	return Builder{
+		extra_tags: " release yara ",
+		goos:       "windows",
+		arch:       "amd64"}.Run()
+}
+
+func WindowsDev() error {
+	return Builder{
+		goos:       "windows",
+		extra_tags: " release yara ",
+		filename:   "velociraptor.exe",
+		arch:       "amd64"}.Run()
+}
+
+// Windows binary with race detection. This requires building on
+// windows (ie not cross compiling). You will need to install gcc
+// first using https://jmeubank.github.io/tdm-gcc/ as well as the Go
+// windows distribution and optionally the windows node distribution
+// (for the GUI).
+func WindowsTest() error {
+	return Builder{
+		goos:        "windows",
+		extra_tags:  " release yara ",
+		filename:    "velociraptor.exe",
+		arch:        "amd64",
+		extra_flags: []string{"-race"}}.Run()
+}
+
+func Windowsx86() error {
+	return Builder{
+		extra_tags: " release yara ",
+		goos:       "windows",
+		arch:       "386"}.Run()
+}
+
 func Darwin() error {
-	return sh.RunV(
-		"xgo", "-out", filepath.Join("output", "velociraptor-"+version), "-v",
-		"--targets", "darwin/amd64",
-		"-tags", "release",
-		"-ldflags=-s -w "+flags(),
-		"./bin/")
+	return Builder{goos: "darwin",
+		extra_tags: " release yara ",
+		arch:       "amd64"}.Run()
+}
+
+func DarwinBase() error {
+	return Builder{goos: "darwin",
+		extra_tags:  " release ",
+		disable_cgo: true,
+		arch:        "amd64"}.Run()
+}
+
+// Build step for Appveyor.
+func Appveyor() error {
+	err := build_gui_files()
+	if err != nil {
+		return err
+	}
+
+	err = Builder{
+		goos:       "windows",
+		arch:       "amd64",
+		extra_tags: " release ",
+		filename:   "velociraptor.exe"}.Run()
+
+	if err != nil {
+		return err
+	}
+
+	return nil
+
+	// Build a linux binary on Appveyor without cgo. This is
+	// typically OK because it is mostly used for the server. It
+	// will be missing yara etc.
+	return Builder{
+		goos:        "linux",
+		arch:        "amd64",
+		extra_tags:  " release ",
+		disable_cgo: true,
+		filename:    "velociraptor-linux.elf"}.Run()
 }
 
 func Clean() error {
@@ -196,6 +350,26 @@ func Clean() error {
 	}
 
 	return nil
+}
+
+func build_gui_files() error {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+	defer os.Chdir(cwd)
+
+	err = os.Chdir("gui/velociraptor")
+	if err != nil {
+		return err
+	}
+
+	err = sh.RunV("npm", "install")
+	if err != nil {
+		return err
+	}
+
+	return sh.RunV("npm", "run", "build")
 }
 
 func flags() string {
@@ -212,7 +386,7 @@ func hash() string {
 func fileb0x(asset string) error {
 	err := sh.Run("fileb0x", asset)
 	if err != nil {
-		err = sh.Run(mg.GoCmd(), "get", "github.com/UnnoTed/fileb0x")
+		err = sh.Run(mg.GoCmd(), "get", "github.com/Velocidex/fileb0x@d54f4040016051dd9657ce04d0ae6f31eab99bc6")
 		if err != nil {
 			return err
 		}
@@ -244,6 +418,11 @@ func ensure_assets() error {
 
 func mingwxcompiler_exists() bool {
 	err := sh.Run(mingw_xcompiler, "--version")
+	return err == nil
+}
+
+func mingwxcompiler32_exists() bool {
+	err := sh.Run(mingw_xcompiler_32, "--version")
 	return err == nil
 }
 

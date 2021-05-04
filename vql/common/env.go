@@ -22,6 +22,8 @@ import (
 	"os"
 	"strings"
 
+	"github.com/Velocidex/ordereddict"
+	"www.velocidex.com/golang/velociraptor/acls"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	vfilter "www.velocidex.com/golang/vfilter"
 )
@@ -37,10 +39,17 @@ type EnvFunctionArgs struct {
 type EnvFunction struct{}
 
 func (self *EnvFunction) Call(ctx context.Context,
-	scope *vfilter.Scope,
-	args *vfilter.Dict) vfilter.Any {
+	scope vfilter.Scope,
+	args *ordereddict.Dict) vfilter.Any {
 	arg := &EnvFunctionArgs{}
-	err := vfilter.ExtractArgs(scope, args, arg)
+
+	err := vql_subsystem.CheckAccess(scope, acls.MACHINE_STATE)
+	if err != nil {
+		scope.Log("environ: %s", err)
+		return false
+	}
+
+	err = vfilter.ExtractArgs(scope, args, arg)
 	if err != nil {
 		scope.Log("environ: %s", err.Error())
 		return false
@@ -49,7 +58,7 @@ func (self *EnvFunction) Call(ctx context.Context,
 	return os.Getenv(arg.Var)
 }
 
-func (self *EnvFunction) Info(scope *vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
+func (self *EnvFunction) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
 		Name:    "environ",
 		Doc:     "Get an environment variable.",
@@ -63,8 +72,8 @@ func init() {
 		vfilter.GenericListPlugin{
 			PluginName: "environ",
 			Function: func(
-				scope *vfilter.Scope,
-				args *vfilter.Dict) []vfilter.Row {
+				scope vfilter.Scope,
+				args *ordereddict.Dict) []vfilter.Row {
 				var result []vfilter.Row
 
 				arg := &EnvPluginArgs{}
@@ -74,7 +83,7 @@ func init() {
 					return result
 				}
 
-				row := vfilter.NewDict().
+				row := ordereddict.NewDict().
 					SetDefault(&vfilter.Null{}).
 					SetCaseInsensitive()
 				if len(arg.Vars) == 0 {

@@ -1,4 +1,4 @@
-name: Windows.Persistence.wow64cpu
+name: Windows.Persistence.Wow64cpu
 description: |
   Checks for wow64cpu.dll replacement Autorun in Windows 10.
   http://www.hexacorn.com/blog/2019/07/11/beyond-good-ol-run-key-part-108-2/
@@ -13,13 +13,11 @@ sources:
       SELECT OS From info() where OS = 'windows'
 
     queries:
-    - LET users <= SELECT Name, UUID FROM Artifact.Windows.Sys.Users()
     - |
       SELECT dirname(path=FullPath) as KeyPath,
         Name as KeyName,
         Data.value as Value,
-        timestamp(epoch=Mtime.Sec) AS LastModified
+        Mtime AS LastModified
       FROM glob(globs=split(string=TargetRegKey, sep=","), accessor="reg")
-      WHERE Data.value and 
-        not (Name = "@" and (Data.value = "wow64cpu.dll"
-            or Data.value = "wowarmhw.dll" or Data.value = "xtajit.dll"))
+      WHERE Data.value and
+        not (Name = "@" and (Data.value =~ "(wow64cpu.dll|wowarmhw.dll|xtajit.dll)"))

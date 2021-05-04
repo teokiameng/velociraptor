@@ -36,8 +36,10 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/Velocidex/ordereddict"
 	ole "github.com/go-ole/go-ole"
 	pointer "github.com/mattn/go-pointer"
+	"www.velocidex.com/golang/velociraptor/acls"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	wmi_parse "www.velocidex.com/golang/velociraptor/vql/windows/wmi/parse"
 	vfilter "www.velocidex.com/golang/vfilter"
@@ -45,17 +47,17 @@ import (
 
 type WMIObject struct {
 	Raw    string
-	parsed *vfilter.Dict
+	parsed *ordereddict.Dict
 }
 
-func (self *WMIObject) Parse() (*vfilter.Dict, error) {
+func (self *WMIObject) Parse() (*ordereddict.Dict, error) {
 	if self.parsed != nil {
 		return self.parsed, nil
 	}
 
 	mof, err := wmi_parse.Parse(self.Raw)
 	if err != nil {
-		return vfilter.NewDict(), err
+		return ordereddict.NewDict(), err
 	}
 	self.parsed = mof.ToDict()
 	return self.parsed, nil
@@ -63,7 +65,7 @@ func (self *WMIObject) Parse() (*vfilter.Dict, error) {
 
 type eventQueryContext struct {
 	output chan vfilter.Row
-	scope  *vfilter.Scope
+	scope  vfilter.Scope
 }
 
 // This is called to handle the serialized event string. We just send
@@ -83,9 +85,11 @@ func (self *eventQueryContext) Log(message string) {
 
 //export process_event
 func process_event(ctx *C.int, bstring **C.ushort) {
-	go_ctx := pointer.Restore(unsafe.Pointer(ctx)).(*eventQueryContext)
-	text := ole.BstrToString(*(**uint16)(unsafe.Pointer(bstring)))
-	go_ctx.ProcessEvent(text)
+	go_ctx, ok := pointer.Restore(unsafe.Pointer(ctx)).(*eventQueryContext)
+	if ok {
+		text := ole.BstrToString(*(**uint16)(unsafe.Pointer(bstring)))
+		go_ctx.ProcessEvent(text)
+	}
 }
 
 //export log_error
@@ -106,17 +110,24 @@ type WmiEventPlugin struct{}
 
 func (self WmiEventPlugin) Call(
 	ctx context.Context,
-	scope *vfilter.Scope,
-	args *vfilter.Dict) <-chan vfilter.Row {
+	scope vfilter.Scope,
+	args *ordereddict.Dict) <-chan vfilter.Row {
 	output_chan := make(chan vfilter.Row)
 	arg := &WmiEventPluginArgs{}
 
 	go func() {
 		defer close(output_chan)
+
+		err := vql_subsystem.CheckAccess(scope, acls.MACHINE_STATE)
+		if err != nil {
+			scope.Log("wmi_events: %s", err)
+			return
+		}
+
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()
 
-		err := vfilter.ExtractArgs(scope, args, arg)
+		err = vfilter.ExtractArgs(scope, args, arg)
 		if err != nil {
 			scope.Log("wmi_events: %s", err.Error())
 			return
@@ -151,7 +162,7 @@ func (self WmiEventPlugin) Call(
 			return
 		}
 
-		for {
+		for item := range event_context.output {
 			select {
 			case <-sub_ctx.Done():
 				// Destroy the C context - we are done here.
@@ -161,11 +172,7 @@ func (self WmiEventPlugin) Call(
 				// Read the next item from the event
 				// queue and send it to the VQL
 				// subsystem.
-			case item, ok := <-event_context.output:
-				if !ok {
-					return
-				}
-				output_chan <- item
+			case output_chan <- item:
 			}
 		}
 	}()
@@ -173,7 +180,7 @@ func (self WmiEventPlugin) Call(
 	return output_chan
 }
 
-func (self WmiEventPlugin) Info(scope *vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.PluginInfo {
+func (self WmiEventPlugin) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.PluginInfo {
 	return &vfilter.PluginInfo{
 		Name:    "wmi_events",
 		Doc:     "Executes an evented WMI queries asynchronously.",

@@ -1,4 +1,7 @@
 Queries:
+  - SELECT mock(plugin='info', results=[dict(OS='windows'), dict(OS='windows')] )
+    FROM scope()
+
 # Just find a zip file.
   - SELECT basename(path=FullPath) AS File, Hash, Size, Upload, Keywords
     FROM Artifact.Windows.Search.FileFinder(
@@ -19,5 +22,5 @@ Queries:
 # Search for files that match a keyword
   - SELECT basename(path=FullPath) AS File, Keywords
     FROM Artifact.Windows.Search.FileFinder(
-        Keywords="supercalifragilisticexpialidocious",
+        YaraRule="wide nocase ascii:supercalifragilisticexpialidocious",
         SearchFilesGlob=srcDir + "/artifacts/testdata/**/*.in.yaml")

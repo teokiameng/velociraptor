@@ -21,6 +21,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/Velocidex/ordereddict"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
 )
@@ -33,8 +34,8 @@ type IpArgs struct {
 type IpFunction struct{}
 
 func (self *IpFunction) Call(ctx context.Context,
-	scope *vfilter.Scope,
-	args *vfilter.Dict) vfilter.Any {
+	scope vfilter.Scope,
+	args *ordereddict.Dict) vfilter.Any {
 	arg := &IpArgs{}
 	err := vfilter.ExtractArgs(scope, args, arg)
 	if err != nil {
@@ -61,7 +62,7 @@ func (self *IpFunction) Call(ctx context.Context,
 	}
 }
 
-func (self IpFunction) Info(scope *vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
+func (self IpFunction) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
 		Name:    "ip",
 		Doc:     "Format an IP address.",

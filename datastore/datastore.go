@@ -20,104 +20,117 @@ package datastore
 
 import (
 	"errors"
+	"sync"
 
-	"github.com/golang/protobuf/proto"
-	api_proto "www.velocidex.com/golang/velociraptor/api/proto"
+	"google.golang.org/protobuf/proto"
+	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	crypto_proto "www.velocidex.com/golang/velociraptor/crypto/proto"
 )
 
 var (
-	implementations map[string]DataStore
+	mu sync.Mutex
 )
+
+type SortingSense int
+
+const (
+	UNSORTED  = SortingSense(0)
+	SORT_UP   = SortingSense(1)
+	SORT_DOWN = SortingSense(2)
+)
+
+type WalkFunc func(urn string) error
 
 type DataStore interface {
 	// Retrieve all the client's tasks.
 	GetClientTasks(
-		config_obj *api_proto.Config,
+		config_obj *config_proto.Config,
 		client_id string,
-		do_not_lease bool) ([]*crypto_proto.GrrMessage, error)
+		do_not_lease bool) ([]*crypto_proto.VeloMessage, error)
 
 	UnQueueMessageForClient(
-		config_obj *api_proto.Config,
+		config_obj *config_proto.Config,
 		client_id string,
-		message *crypto_proto.GrrMessage) error
+		message *crypto_proto.VeloMessage) error
 
 	QueueMessageForClient(
-		config_obj *api_proto.Config,
+		config_obj *config_proto.Config,
 		client_id string,
-		flow_id string,
-		client_action string,
-		message proto.Message,
-		next_state uint64) error
+		message *crypto_proto.VeloMessage) error
 
+	// Reads a stored message from the datastore. If there is no
+	// stored message at this URN, the function returns an
+	// os.ErrNotExist error.
 	GetSubject(
-		config_obj *api_proto.Config,
+		config_obj *config_proto.Config,
 		urn string,
 		message proto.Message) error
 
 	SetSubject(
-		config_obj *api_proto.Config,
+		config_obj *config_proto.Config,
 		urn string,
 		message proto.Message) error
 
 	DeleteSubject(
-		config_obj *api_proto.Config,
+		config_obj *config_proto.Config,
 		urn string) error
 
 	// Lists all the children of a URN.
 	ListChildren(
-		config_obj *api_proto.Config,
+		config_obj *config_proto.Config,
 		urn string,
 		offset uint64, length uint64) ([]string, error)
+
+	Walk(config_obj *config_proto.Config,
+		root string, walkFn WalkFunc) error
 
 	// Update the posting list index. Searching for any of the
 	// keywords will return the entity urn.
 	SetIndex(
-		config_obj *api_proto.Config,
+		config_obj *config_proto.Config,
 		index_urn string,
 		entity string,
 		keywords []string) error
 
 	UnsetIndex(
-		config_obj *api_proto.Config,
+		config_obj *config_proto.Config,
 		index_urn string,
 		entity string,
 		keywords []string) error
 
 	CheckIndex(
-		config_obj *api_proto.Config,
+		config_obj *config_proto.Config,
 		index_urn string,
 		entity string,
 		keywords []string) error
 
 	SearchClients(
-		config_obj *api_proto.Config,
+		config_obj *config_proto.Config,
 		index_urn string,
 		query string, query_type string,
-		offset uint64, limit uint64) []string
+		offset uint64, limit uint64, sort SortingSense) []string
 
 	// Called to close all db handles etc. Not thread safe.
 	Close()
 }
 
-func RegisterImplementation(name string, impl DataStore) {
-	if implementations == nil {
-		implementations = make(map[string]DataStore)
+func GetDB(config_obj *config_proto.Config) (DataStore, error) {
+	if config_obj.Datastore == nil {
+		return nil, errors.New("no datastore configured")
 	}
 
-	implementations[name] = impl
-}
+	switch config_obj.Datastore.Implementation {
+	case "FileBaseDataStore":
+		return file_based_imp, nil
 
-func GetImpl(name string) (DataStore, bool) {
-	result, pres := implementations[name]
-	return result, pres
-}
+	case "Test":
+		mu.Lock()
+		defer mu.Unlock()
 
-func GetDB(config_obj *api_proto.Config) (DataStore, error) {
-	db, pres := GetImpl(config_obj.Datastore.Implementation)
-	if !pres {
-		return nil, errors.New("no datastore implementation")
+		return gTestDatastore, nil
+
+	default:
+		return nil, errors.New("no datastore implementation " +
+			config_obj.Datastore.Implementation)
 	}
-
-	return db, nil
 }

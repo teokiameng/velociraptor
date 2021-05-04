@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"regexp"
 
+	"github.com/Velocidex/ordereddict"
 	glob "www.velocidex.com/golang/velociraptor/glob"
 	utils "www.velocidex.com/golang/velociraptor/utils"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
@@ -50,11 +51,17 @@ type _SplitRecordParser struct{}
 
 func processFile(
 	ctx context.Context,
-	scope *vfilter.Scope,
+	scope vfilter.Scope,
 	file string, arg *_SplitRecordParserArgs,
 	output_chan chan vfilter.Row) {
 
-	accessor, err := glob.GetAccessor(arg.Accessor, ctx)
+	err := vql_subsystem.CheckFilesystemAccess(scope, arg.Accessor)
+	if err != nil {
+		scope.Log("split_records: %s", err)
+		return
+	}
+
+	accessor, err := glob.GetAccessor(arg.Accessor, scope)
 	if err != nil {
 		scope.Log("split_records: %v", err)
 		return
@@ -87,7 +94,7 @@ func processFile(
 				if arg.First_row_is_headers {
 					count := 1
 					for _, item := range items {
-						if utils.InString(&arg.Columns, item) {
+						if utils.InString(arg.Columns, item) {
 							item = fmt.Sprintf("%s%d",
 								item, count)
 							count += 1
@@ -105,7 +112,7 @@ func processFile(
 						fmt.Sprintf("Column%d", idx))
 				}
 			}
-			result := vfilter.NewDict()
+			result := ordereddict.NewDict()
 			for idx, column := range arg.Columns {
 				if idx < len(items) {
 					result.Set(column, items[idx])
@@ -113,15 +120,20 @@ func processFile(
 					result.Set(column, vfilter.Null{})
 				}
 			}
-			output_chan <- result
+			select {
+			case <-ctx.Done():
+				return
+
+			case output_chan <- result:
+			}
 		}
 	}
 }
 
 func (self _SplitRecordParser) Call(
 	ctx context.Context,
-	scope *vfilter.Scope,
-	args *vfilter.Dict) <-chan vfilter.Row {
+	scope vfilter.Scope,
+	args *ordereddict.Dict) <-chan vfilter.Row {
 	output_chan := make(chan vfilter.Row)
 	var compiled_regex *regexp.Regexp
 
@@ -129,6 +141,10 @@ func (self _SplitRecordParser) Call(
 	err := vfilter.ExtractArgs(scope, args, &arg)
 	if err != nil {
 		goto error
+	}
+
+	if arg.Regex == "" {
+		arg.Regex = "\\s+"
 	}
 
 	compiled_regex, err = regexp.Compile(arg.Regex)
@@ -164,7 +180,7 @@ func (self _SplitRecordParser) Name() string {
 	return "split_records"
 }
 
-func (self _SplitRecordParser) Info(scope *vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.PluginInfo {
+func (self _SplitRecordParser) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.PluginInfo {
 	return &vfilter.PluginInfo{
 		Name:    "split_records",
 		Doc:     "Parses files by splitting lines into records.",

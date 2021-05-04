@@ -18,9 +18,11 @@
 package utils
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
+	"time"
 
 	errors "github.com/pkg/errors"
 )
@@ -30,7 +32,8 @@ import (
 // CopyFile copies a file from src to dst. If src and dst files exist, and are
 // the same, then return success. Otherise, attempt to create a hard link
 // between the two files. If that fail, copy the file contents from src to dst.
-func CopyFile(src, dst string, mode os.FileMode) (err error) {
+func CopyFile(ctx context.Context,
+	src, dst string, mode os.FileMode) (err error) {
 	sfi, err := os.Stat(src)
 	if err != nil {
 		return errors.WithStack(err)
@@ -66,7 +69,7 @@ func CopyFile(src, dst string, mode os.FileMode) (err error) {
 
 	// This may not work if the files are on different filesystems
 	// or the filesystem does not support it.
-	return copyFileContents(src, dst, mode)
+	return copyFileContents(ctx, src, dst, mode)
 
 }
 
@@ -74,7 +77,8 @@ func CopyFile(src, dst string, mode os.FileMode) (err error) {
 // by dst. The file will be created if it does not already exist. If the
 // destination file exists, all it's contents will be replaced by the contents
 // of the source file.
-func copyFileContents(src, dst string, mode os.FileMode) (err error) {
+func copyFileContents(ctx context.Context,
+	src, dst string, mode os.FileMode) (err error) {
 	in, err := os.Open(src)
 	if err != nil {
 		return errors.WithStack(err)
@@ -93,7 +97,7 @@ func copyFileContents(src, dst string, mode os.FileMode) (err error) {
 		}
 	}()
 
-	if _, err = io.Copy(out, in); err != nil {
+	if _, err = Copy(ctx, out, in); err != nil {
 		return errors.WithStack(err)
 	}
 
@@ -102,6 +106,7 @@ func copyFileContents(src, dst string, mode os.FileMode) (err error) {
 
 type DataReadSeekCloser struct {
 	io.ReadSeeker
+	Data string
 }
 
 func (self DataReadSeekCloser) Close() error {
@@ -109,5 +114,69 @@ func (self DataReadSeekCloser) Close() error {
 }
 
 func (self DataReadSeekCloser) Stat() (os.FileInfo, error) {
-	return nil, errors.New("Not implemented")
+	return &DataFileInfo{[]byte(self.Data)}, nil
+}
+
+func NewDataFileInfo(data string) *DataFileInfo {
+	return &DataFileInfo{[]byte(data)}
+}
+
+type DataFileInfo struct {
+	RawData []byte
+}
+
+func (self *DataFileInfo) IsDir() bool {
+	return false
+}
+
+func (self *DataFileInfo) Size() int64 {
+	return int64(len(self.RawData))
+}
+
+func (self *DataFileInfo) Data() interface{} {
+	return nil
+}
+
+func (self *DataFileInfo) Name() string {
+	return string(self.RawData)
+}
+
+func (self *DataFileInfo) Sys() interface{} {
+	return nil
+}
+
+func (self *DataFileInfo) Mode() os.FileMode {
+	return 0755
+}
+
+func (self *DataFileInfo) ModTime() time.Time {
+	return time.Time{}
+}
+
+func (self *DataFileInfo) FullPath() string {
+	return string(self.RawData)
+}
+
+func (self *DataFileInfo) Btime() time.Time {
+	return time.Time{}
+}
+
+func (self *DataFileInfo) Mtime() time.Time {
+	return time.Time{}
+}
+
+func (self *DataFileInfo) Ctime() time.Time {
+	return self.Mtime()
+}
+
+func (self *DataFileInfo) Atime() time.Time {
+	return self.Mtime()
+}
+
+func (self *DataFileInfo) IsLink() bool {
+	return false
+}
+
+func (self *DataFileInfo) GetLink() (string, error) {
+	return "", errors.New("Not implemented")
 }

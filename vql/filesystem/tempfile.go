@@ -19,35 +19,65 @@ package filesystem
 
 import (
 	"context"
+	"io/ioutil"
 	"os"
+	"runtime"
+	"time"
 
-	"github.com/tink-ab/tempfile"
+	"github.com/Velocidex/ordereddict"
+	"www.velocidex.com/golang/velociraptor/acls"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
 )
 
 type _TempfileRequest struct {
-	Data      []string `vfilter:"required,field=data,doc=Data to write in the tempfile."`
-	Extension string   `vfilter:"optional,field=extension,doc=An extension to place in the tempfile."`
+	Data        []string `vfilter:"optional,field=data,doc=Data to write in the tempfile."`
+	Extension   string   `vfilter:"optional,field=extension,doc=An extension to place in the tempfile."`
+	Permissions string   `vfilter:"optional,field=permissions,doc=Required permissions (e.g. 'x')."`
+	RemoveLast  bool     `vfilter:"optional,field=remove_last,doc=If set we delay removal as much as possible."`
 }
 
 type TempfileFunction struct{}
 
 func (self *TempfileFunction) Call(ctx context.Context,
-	scope *vfilter.Scope,
-	args *vfilter.Dict) vfilter.Any {
+	scope vfilter.Scope,
+	args *ordereddict.Dict) vfilter.Any {
+
+	err := vql_subsystem.CheckAccess(scope, acls.FILESYSTEM_WRITE)
+	if err != nil {
+		scope.Log("tempfile: %s", err)
+		return false
+	}
+
 	arg := &_TempfileRequest{}
-	err := vfilter.ExtractArgs(scope, args, arg)
+	err = vfilter.ExtractArgs(scope, args, arg)
 	if err != nil {
 		scope.Log("tempfile: %s", err.Error())
 		return false
 	}
 
-	tmpfile, err := tempfile.TempFile("", "tmp", arg.Extension)
+	permissions := os.FileMode(0600)
+	switch arg.Permissions {
+	case "x":
+		permissions = 0700
+
+		// On windows executable means it has a .exe extension.
+		if runtime.GOOS == "windows" {
+			arg.Extension = ".exe"
+		}
+
+	case "r":
+		permissions = 0400
+	}
+
+	tmpfile, err := ioutil.TempFile("", "tmp*"+arg.Extension)
 	if err != nil {
 		scope.Log("tempfile: %v", err)
 		return false
 	}
+
+	// Try to set the permissions to the desired level.
+	_ = os.Chmod(tmpfile.Name(), permissions)
 
 	for _, content := range arg.Data {
 		_, err := tmpfile.Write([]byte(content))
@@ -62,14 +92,39 @@ func (self *TempfileFunction) Call(ctx context.Context,
 	}
 
 	// Make sure the file is removed when the query is done.
-	scope.AddDestructor(func() {
+	removal := func() {
 		scope.Log("tempfile: removing tempfile %v", tmpfile.Name())
-		os.Remove(tmpfile.Name())
-	})
+
+		// On windows especially we can not remove files that
+		// are opened by something else, so we keep trying for
+		// a while.
+		for i := 0; i < 100; i++ {
+			err := os.Remove(tmpfile.Name())
+			if err == nil {
+				break
+			}
+			time.Sleep(time.Second)
+		}
+	}
+
+	if arg.RemoveLast {
+		scope.Log("Adding global destructor for %v", tmpfile.Name())
+		err := vql_subsystem.GetRootScope(scope).AddDestructor(removal)
+		if err != nil {
+			removal()
+			scope.Log("tempfile: %v", err)
+		}
+	} else {
+		err := scope.AddDestructor(removal)
+		if err != nil {
+			removal()
+			scope.Log("tempfile: %v", err)
+		}
+	}
 	return tmpfile.Name()
 }
 
-func (self TempfileFunction) Info(scope *vfilter.Scope,
+func (self TempfileFunction) Info(scope vfilter.Scope,
 	type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
 		Name:    "tempfile",
@@ -78,6 +133,80 @@ func (self TempfileFunction) Info(scope *vfilter.Scope,
 	}
 }
 
+type _TempdirRequest struct {
+	RemoveLast bool `vfilter:"optional,field=remove_last,doc=If set we delay removal as much as possible."`
+}
+
+type TempdirFunction struct{}
+
+func (self *TempdirFunction) Call(ctx context.Context,
+	scope vfilter.Scope,
+	args *ordereddict.Dict) vfilter.Any {
+
+	err := vql_subsystem.CheckAccess(scope, acls.FILESYSTEM_WRITE)
+	if err != nil {
+		scope.Log("tempdir: %s", err)
+		return false
+	}
+
+	arg := &_TempdirRequest{}
+	err = vfilter.ExtractArgs(scope, args, arg)
+	if err != nil {
+		scope.Log("tempdir: %s", err.Error())
+		return false
+	}
+
+	dir, err := ioutil.TempDir("", "tmp")
+	if err != nil {
+		scope.Log("tempdir: %v", err)
+		return false
+	}
+
+	// Make sure the file is removed when the query is done.
+	removal := func() {
+		scope.Log("tempdir: removing tempdir %v", dir)
+
+		// On windows especially we can not remove files that
+		// are opened by something else, so we keep trying for
+		// a while.
+		for i := 0; i < 100; i++ {
+			err := os.RemoveAll(dir)
+			if err == nil {
+				break
+			}
+			time.Sleep(time.Second)
+		}
+	}
+
+	if arg.RemoveLast {
+		scope.Log("Adding global destructor for %v", dir)
+		err := vql_subsystem.GetRootScope(scope).AddDestructor(removal)
+		if err != nil {
+			removal()
+			scope.Log("tempdir: %v", err)
+		}
+
+	} else {
+		err := scope.AddDestructor(removal)
+		if err != nil {
+			removal()
+			scope.Log("tempdir: %v", err)
+		}
+
+	}
+	return dir
+}
+
+func (self TempdirFunction) Info(scope vfilter.Scope,
+	type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
+	return &vfilter.FunctionInfo{
+		Name:    "tempdir",
+		Doc:     "Create a temporary directory. The directory will be removed when the query ends.",
+		ArgType: type_map.AddType(scope, &_TempdirRequest{}),
+	}
+}
+
 func init() {
+	vql_subsystem.RegisterFunction(&TempdirFunction{})
 	vql_subsystem.RegisterFunction(&TempfileFunction{})
 }

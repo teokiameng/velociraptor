@@ -19,15 +19,17 @@ package main
 
 import (
 	"context"
-	"os"
-	"os/signal"
+	"sync"
 
 	kingpin "gopkg.in/alecthomas/kingpin.v2"
 	"www.velocidex.com/golang/velociraptor/config"
-	"www.velocidex.com/golang/velociraptor/crypto"
+	crypto_client "www.velocidex.com/golang/velociraptor/crypto/client"
+	crypto_utils "www.velocidex.com/golang/velociraptor/crypto/utils"
 	"www.velocidex.com/golang/velociraptor/executor"
 	"www.velocidex.com/golang/velociraptor/http_comms"
 	logging "www.velocidex.com/golang/velociraptor/logging"
+	"www.velocidex.com/golang/velociraptor/services"
+	"www.velocidex.com/golang/velociraptor/utils"
 )
 
 var (
@@ -35,52 +37,92 @@ var (
 	client = app.Command("client", "Run the velociraptor client")
 )
 
-func RunClient(config_path *string) {
-	config_obj, err := config.LoadClientConfig(*config_path)
+func RunClient(
+	ctx context.Context,
+	wg *sync.WaitGroup,
+	config_path *string) {
+
+	// Include the writeback in the client's configuration.
+	config_obj, err := new(config.Loader).
+		WithVerbose(*verbose_flag).
+		WithFileLoader(*config_path).
+		WithEmbedded().
+		WithEnvLoader("VELOCIRAPTOR_CONFIG").
+		WithCustomValidator(initFilestoreAccessor).
+		WithCustomValidator(initDebugServer).
+		WithLogFile(*logging_flag).
+		WithRequiredClient().
+		WithRequiredLogging().
+		WithWriteback().LoadAndValidate()
 	kingpin.FatalIfError(err, "Unable to load config file")
 
-	// Make sure the config is ok.
-	err = crypto.VerifyConfig(config_obj)
+	// Make sure the config crypto is ok.
+	err = crypto_utils.VerifyConfig(config_obj)
 	if err != nil {
 		kingpin.FatalIfError(err, "Invalid config")
 	}
 
-	manager, err := crypto.NewClientCryptoManager(
+	executor.SetTempfile(config_obj)
+
+	manager, err := crypto_client.NewClientCryptoManager(
 		config_obj, []byte(config_obj.Writeback.PrivateKey))
 	if err != nil {
 		kingpin.FatalIfError(err, "Unable to parse config file")
 	}
 
-	exe, err := executor.NewClientExecutor(config_obj)
+	// Start all the services
+	sm := services.NewServiceManager(ctx, config_obj)
+	defer sm.Close()
+
+	exe, err := executor.NewClientExecutor(ctx, config_obj)
 	if err != nil {
 		kingpin.FatalIfError(err, "Can not create executor.")
 	}
 
+	err = executor.StartServices(sm, manager.ClientId, exe)
+	if err != nil {
+		kingpin.FatalIfError(err, "Can not start services.")
+	}
+
+	// Now start the communicator so we can talk with the server.
 	comm, err := http_comms.NewHTTPCommunicator(
 		config_obj,
 		manager,
 		exe,
 		config_obj.Client.ServerUrls,
+		func() { on_error(config_obj) },
+		utils.RealClock{},
 	)
-	if err != nil {
-		kingpin.FatalIfError(err, "Can not create HTTPCommunicator.")
-	}
+	kingpin.FatalIfError(err, "Can not create HTTPCommunicator.")
 
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, os.Interrupt)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
 
-	go comm.Run(context.Background())
+		comm.Run(ctx)
+	}()
 
-	<-quit
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-ctx.Done()
 
-	logger := logging.GetLogger(config_obj, &logging.ClientComponent)
-	logger.Info("Interrupted! Shutting down\n")
+		logger := logging.GetLogger(config_obj, &logging.ClientComponent)
+		logger.Info("<cyan>Interrupted!</> Shutting down\n")
+	}()
+
+	wg.Wait()
 }
 
 func init() {
 	command_handlers = append(command_handlers, func(command string) bool {
 		if command == client.FullCommand() {
-			RunClient(config_path)
+			wg := &sync.WaitGroup{}
+			ctx, cancel := install_sig_handler()
+			defer cancel()
+
+			RunClient(ctx, wg, config_path)
+
 			return true
 		}
 		return false

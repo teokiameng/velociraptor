@@ -1,11 +1,12 @@
 syntax = "proto3";
 
-
-import "www.velocidex.com/golang/velociraptor/proto/semantic.proto";
-import "www.velocidex.com/golang/velociraptor/actions/proto/vql.proto";
-import "www.velocidex.com/golang/velociraptor/artifacts/proto/artifact.proto";
+import "proto/semantic.proto";
+import "artifacts/proto/artifact.proto";
+import "flows/proto/artifact_collector.proto";
 
 package proto;
+
+option go_package = "www.velocidex.com/golang/velociraptor/api/proto";
 
 message GetArtifactsRequest {
     // Deprecated
@@ -15,6 +16,8 @@ message GetArtifactsRequest {
     string search_term = 3;
     uint64 number_of_results = 4;
     string type = 5;
+
+    string report_type = 7;
 
     repeated string names = 6 [(sem_type) = {
        description: "A list of artifacts to fetch"
@@ -59,9 +62,20 @@ message SetArtifactRequest {
         }];
 }
 
+message LoadArtifactError {
+    string filename = 1;
+    string error = 2;
+}
+
+message LoadArtifactPackResponse {
+    repeated string successful_artifacts = 1;
+
+    repeated LoadArtifactError errors = 2;
+}
+
 message APIResponse {
     bool error = 1 [(sem_type) = {
-            description: "An error occured setting the artifact.",
+            description: "An error occurred setting the artifact.",
         }];
 
     string error_message = 2;
@@ -112,7 +126,6 @@ message GetReportResponse {
         }];
 }
 
-
 // Deprecated.
 message ArtifactCompressionDict {}
 
@@ -125,9 +138,28 @@ message ListAvailableEventResultsRequest {
 
 message AvailableEvent {
     string artifact = 1;
+    Artifact definition = 3;
     repeated int32 timestamps = 2;
 }
 
 message ListAvailableEventResultsResponse {
     repeated AvailableEvent logs = 1;
+}
+
+message GetMonitoringStateRequest {
+    // Client monitoring states are controlled by labels.
+    string label = 1;
+}
+
+message GetMonitoringStateResponse {
+    // List all the labels matching the request
+    repeated SetMonitoringStateRequest requests = 1;
+}
+
+message SetMonitoringStateRequest {
+    // Sets the monitoring table for a subset of clients specified by
+    // label.
+    string label = 1;
+
+    ArtifactCollectorArgs request = 2;
 }

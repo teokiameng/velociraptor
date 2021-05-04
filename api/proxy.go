@@ -20,28 +20,35 @@ package api
 import (
 	"crypto/tls"
 	"crypto/x509"
-	"errors"
-	"fmt"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
-	"time"
 
-	"github.com/grpc-ecosystem/grpc-gateway/runtime"
-	"github.com/sirupsen/logrus"
+	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
+	errors "github.com/pkg/errors"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/protobuf/encoding/protojson"
+	"www.velocidex.com/golang/velociraptor/api/authenticators"
 	api_proto "www.velocidex.com/golang/velociraptor/api/proto"
+	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/constants"
-	"www.velocidex.com/golang/velociraptor/crypto"
+	crypto_utils "www.velocidex.com/golang/velociraptor/crypto/utils"
+	file_store "www.velocidex.com/golang/velociraptor/file_store"
+	"www.velocidex.com/golang/velociraptor/file_store/api"
 	"www.velocidex.com/golang/velociraptor/grpc_client"
 	"www.velocidex.com/golang/velociraptor/logging"
 )
 
-func AddProxyMux(config_obj *api_proto.Config, mux *http.ServeMux) error {
-	logger := logging.Manager.GetLogger(config_obj, &logging.GUIComponent)
+// A Mux for the reverse proxy feature.
+func AddProxyMux(config_obj *config_proto.Config, mux *http.ServeMux) error {
+	if config_obj.GUI == nil {
+		return errors.New("GUI not configured")
+	}
+
+	logger := logging.GetLogger(config_obj, &logging.GUIComponent)
 
 	for _, reverse_proxy_config := range config_obj.GUI.ReverseProxy {
 		target, err := url.Parse(reverse_proxy_config.Url)
@@ -54,7 +61,6 @@ func AddProxyMux(config_obj *api_proto.Config, mux *http.ServeMux) error {
 
 		var handler http.Handler
 		if target.Scheme == "file" {
-			fmt.Printf(target.Path)
 			handler = http.StripPrefix(reverse_proxy_config.Route,
 				http.FileServer(http.Dir(target.Path)))
 
@@ -65,14 +71,26 @@ func AddProxyMux(config_obj *api_proto.Config, mux *http.ServeMux) error {
 					r.URL.Scheme = target.Scheme
 					r.Header.Set("X-Forwarded-Host", r.Header.Get("Host"))
 					r.Host = target.Host
-					r.Header.Del("Authorization")
+
+					// If we require auth we do
+					// not pass the auth header to
+					// the target of the
+					// proxy. Otherwise we leave
+					// authentication to it.
+					if reverse_proxy_config.RequireAuth {
+						r.Header.Del("Authorization")
+					}
 
 					httputil.NewSingleHostReverseProxy(target).ServeHTTP(w, r)
 				}))
 		}
 
 		if reverse_proxy_config.RequireAuth {
-			handler = checkUserCredentialsHandler(config_obj, handler)
+			auther, err := authenticators.NewAuthenticator(config_obj)
+			if err != nil {
+				return err
+			}
+			handler = auther.AuthenticateUserHandler(config_obj, handler)
 		}
 
 		mux.Handle(reverse_proxy_config.Route, handler)
@@ -81,23 +99,72 @@ func AddProxyMux(config_obj *api_proto.Config, mux *http.ServeMux) error {
 	return nil
 }
 
-// Prepares a mux by adding handler required for the GUI.
-func PrepareMux(config_obj *api_proto.Config, mux *http.ServeMux) error {
-	ctx := context.Background()
-	h, err := GetAPIHandler(ctx, config_obj)
-	if err != nil {
-		return err
+// Prepares a mux for the GUI by adding handlers required by the GUI.
+func PrepareGUIMux(
+	ctx context.Context,
+	config_obj *config_proto.Config, mux *http.ServeMux) (http.Handler, error) {
+	if config_obj.GUI == nil {
+		return nil, errors.New("GUI not configured")
 	}
 
-	mux.Handle("/api/", checkUserCredentialsHandler(config_obj, h))
-	mux.Handle("/api/v1/download/", checkUserCredentialsHandler(
-		config_obj, flowResultDownloadHandler(config_obj)))
-	mux.Handle("/api/v1/DownloadHuntResults", checkUserCredentialsHandler(
-		config_obj, huntResultDownloadHandler(config_obj)))
-	mux.Handle("/api/v1/DownloadVFSFile/", checkUserCredentialsHandler(
-		config_obj, vfsFileDownloadHandler(config_obj)))
-	mux.Handle("/api/v1/DownloadVFSFolder", checkUserCredentialsHandler(
-		config_obj, vfsFolderDownloadHandler(config_obj)))
+	h, err := GetAPIHandler(ctx, config_obj)
+	if err != nil {
+		return nil, err
+	}
+
+	// The Authenticator is responsible for authenticating the
+	// user via some method. Authenticators may install their own
+	// mux handlers required for the various auth schemes but
+	// ultimately they are responsible for checking the user is
+	// properly authenticated.
+	auther, err := authenticators.NewAuthenticator(config_obj)
+	if err != nil {
+		return nil, err
+	}
+
+	err = auther.AddHandlers(config_obj, mux)
+	if err != nil {
+		return nil, err
+	}
+
+	base := config_obj.GUI.BasePath
+
+	mux.Handle(base+"/api/", csrfProtect(config_obj,
+		auther.AuthenticateUserHandler(config_obj, h)))
+
+	mux.Handle(base+"/api/v1/DownloadTable", csrfProtect(config_obj,
+		auther.AuthenticateUserHandler(
+			config_obj, downloadTable(config_obj))))
+
+	mux.Handle(base+"/api/v1/DownloadVFSFile", csrfProtect(config_obj,
+		auther.AuthenticateUserHandler(
+			config_obj, vfsFileDownloadHandler(config_obj))))
+
+	mux.Handle(base+"/api/v1/DownloadVFSFolder", csrfProtect(config_obj,
+		auther.AuthenticateUserHandler(
+			config_obj, vfsFolderDownloadHandler(config_obj))))
+
+	mux.Handle(base+"/api/v1/UploadTool", csrfProtect(config_obj,
+		auther.AuthenticateUserHandler(
+			config_obj, toolUploadHandler(config_obj))))
+
+	// Serve prepared zip files.
+	mux.Handle(base+"/downloads/", csrfProtect(config_obj,
+		auther.AuthenticateUserHandler(
+			config_obj, http.FileServer(
+				api.NewFileSystem(
+					config_obj,
+					file_store.GetFileStore(config_obj),
+					"/downloads/")))))
+
+	// Serve notebook items
+	mux.Handle(base+"/notebooks/", csrfProtect(config_obj,
+		auther.AuthenticateUserHandler(
+			config_obj, http.FileServer(
+				api.NewFileSystem(
+					config_obj,
+					file_store.GetFileStore(config_obj),
+					"/notebooks/")))))
 
 	// Assets etc do not need auth.
 	install_static_assets(config_obj, mux)
@@ -105,94 +172,21 @@ func PrepareMux(config_obj *api_proto.Config, mux *http.ServeMux) error {
 	// Add reverse proxy support.
 	err = AddProxyMux(config_obj, mux)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	h, err = GetTemplateHandler(config_obj, "/static/templates/app.html")
+	h, err = GetTemplateHandler(config_obj, "/index.html")
 	if err != nil {
-		return err
+		return nil, err
 	}
-	mux.Handle("/app.html", checkUserCredentialsHandler(config_obj, h))
+	mux.Handle(base+"/app/index.html", csrfProtect(config_obj,
+		auther.AuthenticateUserHandler(config_obj, h)))
 
-	h, err = GetTemplateHandler(config_obj, "/static/templates/index.html")
-	if err != nil {
-		return err
-	}
+	mux.Handle(base+"/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, base+"/app/index.html", 302)
+	}))
 
-	// No Auth on / which is a redirect to app.html anyway.
-	mux.Handle("/", h)
-
-	return MaybeAddOAuthHandlers(config_obj, mux)
-}
-
-// Starts a HTTP Server (non encrypted) using the passed in mux. It is
-// not recommended to export the HTTP port to an external interface
-// since it is not encrypted. If you want to use HTTP you should
-// listen on localhost and port forward over ssh.
-func StartHTTPProxy(config_obj *api_proto.Config, mux *http.ServeMux) error {
-	logger := logging.Manager.GetLogger(config_obj, &logging.GUIComponent)
-	if config_obj.GUI.BindAddress != "127.0.0.1" {
-		logger.Info("GUI is not encrypted and listening on public interface. " +
-			"This is not secure. Please enable TLS.")
-	}
-
-	listenAddr := fmt.Sprintf("%s:%d",
-		config_obj.GUI.BindAddress,
-		config_obj.GUI.BindPort)
-
-	logger.WithFields(
-		logrus.Fields{
-			"listenAddr": listenAddr,
-		}).Info("GUI is ready to handle requests")
-
-	return http.ListenAndServe(listenAddr, mux)
-}
-
-func StartSelfSignedHTTPSProxy(config_obj *api_proto.Config, mux *http.ServeMux) error {
-	logger := logging.Manager.GetLogger(config_obj, &logging.GUIComponent)
-
-	cert, err := tls.X509KeyPair(
-		[]byte(config_obj.Frontend.Certificate),
-		[]byte(config_obj.Frontend.PrivateKey))
-	if err != nil {
-		return err
-	}
-
-	listenAddr := fmt.Sprintf("%s:%d",
-		config_obj.GUI.BindAddress,
-		config_obj.GUI.BindPort)
-
-	server := &http.Server{
-		Addr:     listenAddr,
-		Handler:  mux,
-		ErrorLog: logging.NewPlainLogger(config_obj, &logging.FrontendComponent),
-
-		// https://blog.cloudflare.com/the-complete-guide-to-golang-net-http-timeouts/
-		ReadTimeout:  500 * time.Second,
-		WriteTimeout: 900 * time.Second,
-		IdleTimeout:  15 * time.Second,
-		TLSConfig: &tls.Config{
-			MinVersion:               tls.VersionTLS12,
-			CurvePreferences:         []tls.CurveID{tls.CurveP521, tls.CurveP384, tls.CurveP256},
-			Certificates:             []tls.Certificate{cert},
-			PreferServerCipherSuites: true,
-			CipherSuites: []uint16{
-				tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-				tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-				tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
-				tls.TLS_RSA_WITH_AES_256_GCM_SHA384,
-				tls.TLS_RSA_WITH_AES_256_CBC_SHA,
-				tls.TLS_RSA_WITH_AES_128_GCM_SHA256,
-			},
-		},
-	}
-
-	logger.WithFields(
-		logrus.Fields{
-			"listenAddr": listenAddr,
-		}).Info("GUI is ready to handle TLS requests")
-
-	return server.ListenAndServeTLS("", "")
+	return mux, nil
 }
 
 type _templateArgs struct {
@@ -201,25 +195,42 @@ type _templateArgs struct {
 	Help_url   string
 	Report_url string
 	Version    string
+	CsrfToken  string
+	BasePath   string
+	UserTheme  string
 }
 
 // An api handler which connects to the gRPC service (i.e. it is a
 // gRPC client).
 func GetAPIHandler(
 	ctx context.Context,
-	config_obj *api_proto.Config) (http.Handler, error) {
+	config_obj *config_proto.Config) (http.Handler, error) {
+
+	if config_obj.Client == nil ||
+		config_obj.GUI == nil ||
+		config_obj.API == nil {
+		return nil, errors.New("Client not configured")
+	}
 
 	// We need to tell when someone uses HEAD method on our grpc
 	// proxy so we need to pass this information from the request
 	// to the gRPC server using the gRPC metadata.
 	grpc_proxy_mux := runtime.NewServeMux(
+		runtime.WithMarshalerOption(runtime.MIMEWildcard, &runtime.JSONPb{
+			MarshalOptions: protojson.MarshalOptions{
+				UseProtoNames: true,
+			},
+			UnmarshalOptions: protojson.UnmarshalOptions{
+				DiscardUnknown: true,
+			},
+		}),
 		runtime.WithMetadata(
 			func(ctx context.Context, req *http.Request) metadata.MD {
 				md := map[string]string{
 					"METHOD": req.Method,
 				}
 				username, ok := req.Context().Value(
-					contextKeyUser).(string)
+					constants.GRPC_USER_CONTEXT).(string)
 				if ok {
 					md["USER"] = username
 				}
@@ -227,22 +238,6 @@ func GetAPIHandler(
 				return metadata.New(md)
 			}),
 	)
-
-	// If there is no gw cert in the config file, this might be an
-	// old config file. We can generate a new one now for
-	// backwards compatibility.
-	if config_obj.GUI.GwCertificate == "" {
-		// Generate internal certificates so we can tell when
-		// a call came from internal.
-		gw_certificate, err := crypto.GenerateServerCert(
-			config_obj, constants.GRPC_GW_CLIENT_NAME)
-		if err != nil {
-			return nil, err
-		}
-
-		config_obj.GUI.GwCertificate = gw_certificate.Cert
-		config_obj.GUI.GwPrivateKey = gw_certificate.PrivateKey
-	}
 
 	// We use a dedicated gw certificate. The gRPC server will
 	// only accept a relayed username from us.
@@ -258,7 +253,7 @@ func GetAPIHandler(
 	CA_Pool.AppendCertsFromPEM([]byte(config_obj.Client.CaCertificate))
 
 	// Make sure the cert is ok.
-	gw_cert, err := crypto.ParseX509CertFromPemStr(
+	gw_cert, err := crypto_utils.ParseX509CertFromPemStr(
 		[]byte(config_obj.GUI.GwCertificate))
 	if err != nil {
 		return nil, err
@@ -266,17 +261,18 @@ func GetAPIHandler(
 
 	_, err = gw_cert.Verify(x509.VerifyOptions{Roots: CA_Pool})
 	if err != nil {
-		return nil, err
+		return nil, errors.WithStack(err)
 	}
 
-	if gw_cert.Subject.CommonName != constants.GRPC_GW_CLIENT_NAME {
+	gw_name := crypto_utils.GetSubjectName(gw_cert)
+	if gw_name != config_obj.API.PinnedGwName {
 		return nil, errors.New("GUI gRPC proxy Certificate is not correct")
 	}
 
 	creds := credentials.NewTLS(&tls.Config{
 		Certificates: []tls.Certificate{cert},
 		RootCAs:      CA_Pool,
-		ServerName:   constants.FRONTEND_NAME,
+		ServerName:   config_obj.Client.PinnedServerName,
 	})
 
 	opts := []grpc.DialOption{
@@ -290,8 +286,11 @@ func GetAPIHandler(
 		return nil, err
 	}
 
+	base := config_obj.GUI.BasePath
+
 	reverse_proxy_mux := http.NewServeMux()
-	reverse_proxy_mux.Handle("/api/v1/", grpc_proxy_mux)
+	reverse_proxy_mux.Handle(base+"/api/v1/",
+		http.StripPrefix(base, grpc_proxy_mux))
 
 	return reverse_proxy_mux, nil
 }

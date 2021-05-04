@@ -23,8 +23,11 @@ package windows
 
 import (
 	"context"
+	"os"
 
+	"github.com/Velocidex/ordereddict"
 	"golang.org/x/sys/windows/registry"
+	"www.velocidex.com/golang/velociraptor/acls"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	vfilter "www.velocidex.com/golang/vfilter"
 )
@@ -37,16 +40,26 @@ type _ExpandPath struct{}
 
 func (self _ExpandPath) Call(
 	ctx context.Context,
-	scope *vfilter.Scope,
-	args *vfilter.Dict) vfilter.Any {
+	scope vfilter.Scope,
+	args *ordereddict.Dict) vfilter.Any {
+
+	err := vql_subsystem.CheckAccess(scope, acls.MACHINE_STATE)
+	if err != nil {
+		scope.Log("expand: %s", err)
+		return vfilter.Null{}
+	}
+
 	arg := &_ExpandPathArgs{}
-	err := vfilter.ExtractArgs(scope, args, arg)
+	err = vfilter.ExtractArgs(scope, args, arg)
 	if err != nil {
 		scope.Log("expand: %s", err.Error())
 		return vfilter.Null{}
 	}
 
-	expanded_path, err := registry.ExpandString(arg.Path)
+	// Support both go style expandsions and windows style
+	// expansions.
+	path := os.Expand(arg.Path, getenv)
+	expanded_path, err := registry.ExpandString(path)
 	if err != nil {
 		scope.Log("expand: %v", err)
 		return vfilter.Null{}
@@ -55,7 +68,15 @@ func (self _ExpandPath) Call(
 	return expanded_path
 }
 
-func (self _ExpandPath) Info(scope *vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
+func getenv(v string) string {
+	// Allow $ to be escaped (#850) by doubling up $
+	if v == "$" {
+		return "$"
+	}
+	return os.Getenv(v)
+}
+
+func (self _ExpandPath) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
 		Name:    "expand",
 		Doc:     "Expand the path using the environment.",

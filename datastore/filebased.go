@@ -47,32 +47,47 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/golang/protobuf/jsonpb"
-	"github.com/golang/protobuf/proto"
+	"github.com/golang/protobuf/ptypes/empty"
 	errors "github.com/pkg/errors"
-	api_proto "www.velocidex.com/golang/velociraptor/api/proto"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
+	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/constants"
 	crypto_proto "www.velocidex.com/golang/velociraptor/crypto/proto"
 	"www.velocidex.com/golang/velociraptor/logging"
-	"www.velocidex.com/golang/velociraptor/responder"
-	"www.velocidex.com/golang/velociraptor/testing"
-	"www.velocidex.com/golang/velociraptor/urns"
+	"www.velocidex.com/golang/velociraptor/paths"
+	"www.velocidex.com/golang/velociraptor/utils"
+	"www.velocidex.com/golang/velociraptor/vtesting"
+)
+
+var (
+	file_based_imp = &FileBaseDataStore{
+		clock: vtesting.RealClock{},
+	}
+)
+
+const (
+	// On windows all file paths must be prefixed by this to
+	// support long paths.
+	WINDOWS_LFN_PREFIX = "\\\\?\\"
 )
 
 type FileBaseDataStore struct {
-	clock testing.Clock
+	clock vtesting.Clock
 }
 
 func (self *FileBaseDataStore) GetClientTasks(
-	config_obj *api_proto.Config,
+	config_obj *config_proto.Config,
 	client_id string,
-	do_not_lease bool) ([]*crypto_proto.GrrMessage, error) {
-	result := []*crypto_proto.GrrMessage{}
-	now := self.clock.Now().UTC().UnixNano() / 1000
-	tasks_urn := urns.BuildURN("clients", client_id, "tasks")
-	now_urn := tasks_urn + fmt.Sprintf("/%d", now)
+	do_not_lease bool) ([]*crypto_proto.VeloMessage, error) {
+	result := []*crypto_proto.VeloMessage{}
+	now := uint64(self.clock.Now().UTC().UnixNano() / 1000)
 
-	tasks, err := self.ListChildren(config_obj, tasks_urn, 0, 100)
+	client_path_manager := paths.NewClientPathManager(client_id)
+	now_urn := client_path_manager.Task(now).Path()
+
+	tasks, err := self.ListChildren(
+		config_obj, client_path_manager.TasksDirectory().Path(), 0, 100)
 	if err != nil {
 		return nil, err
 	}
@@ -85,7 +100,7 @@ func (self *FileBaseDataStore) GetClientTasks(
 
 		// Here we read the task from the task_urn and remove
 		// it from the queue.
-		message := &crypto_proto.GrrMessage{}
+		message := &crypto_proto.VeloMessage{}
 		err = self.GetSubject(config_obj, task_urn, message)
 		if err != nil {
 			continue
@@ -103,80 +118,103 @@ func (self *FileBaseDataStore) GetClientTasks(
 }
 
 func (self *FileBaseDataStore) UnQueueMessageForClient(
-	config_obj *api_proto.Config,
+	config_obj *config_proto.Config,
 	client_id string,
-	message *crypto_proto.GrrMessage) error {
+	message *crypto_proto.VeloMessage) error {
 
-	task_urn := urns.BuildURN("clients", client_id, "tasks",
-		fmt.Sprintf("/%d", message.TaskId))
-
-	return self.DeleteSubject(config_obj, task_urn)
+	client_path_manager := paths.NewClientPathManager(client_id)
+	return self.DeleteSubject(config_obj,
+		client_path_manager.Task(message.TaskId).Path())
 }
 
 func (self *FileBaseDataStore) QueueMessageForClient(
-	config_obj *api_proto.Config,
+	config_obj *config_proto.Config,
 	client_id string,
-	flow_id string,
-	client_action string,
-	message proto.Message,
-	next_state uint64) error {
+	req *crypto_proto.VeloMessage) error {
 
-	now := self.clock.Now().UTC().UnixNano() / 1000
-	subject := urns.BuildURN("clients", client_id, "tasks",
-		fmt.Sprintf("/%d", now))
-
-	req, err := responder.NewRequest(message)
-	if err != nil {
-		return err
-	}
-
-	req.Name = client_action
-	req.SessionId = flow_id
-	req.RequestId = uint64(next_state)
-	req.TaskId = uint64(now)
-
-	value, err := proto.Marshal(req)
-	if err != nil {
-		return errors.WithStack(err)
-	}
-
-	return writeContentToFile(config_obj, subject, value)
+	req.TaskId = uint64(self.clock.Now().UTC().UnixNano() / 1000)
+	client_path_manager := paths.NewClientPathManager(client_id)
+	return self.SetSubject(config_obj,
+		client_path_manager.Task(req.TaskId).Path(), req)
 }
 
+/* Gets a protobuf encoded struct from the data store.  Objects are
+   addressed by the urn which is a string (URNs are typically managed
+   by a path manager)
+
+   FIXME: Refactor GetSubject to accept path manager directly.
+*/
 func (self *FileBaseDataStore) GetSubject(
-	config_obj *api_proto.Config,
+	config_obj *config_proto.Config,
 	urn string,
 	message proto.Message) error {
 
 	serialized_content, err := readContentFromFile(
-		config_obj, urn, false /* must_exist */)
+		config_obj, urn, true /* must_exist */)
+	if err != nil {
+		return errors.WithMessage(os.ErrNotExist,
+			fmt.Sprintf("While openning %v: %v", urn, err))
+	}
+
+	if strings.HasSuffix(urn, ".json") {
+		err = protojson.Unmarshal(serialized_content, message)
+	} else {
+		err = proto.Unmarshal(serialized_content, message)
+	}
+
+	if err != nil {
+		return errors.WithMessage(os.ErrNotExist,
+			fmt.Sprintf("While openning %v: %v", urn, err))
+	}
+	return nil
+}
+
+func (self *FileBaseDataStore) Walk(config_obj *config_proto.Config,
+	root string, walkFn WalkFunc) error {
+	root_path, err := urnToFilename(config_obj, root)
 	if err != nil {
 		return err
 	}
 
-	if strings.HasSuffix(urn, ".json") {
-		return jsonpb.UnmarshalString(
-			string(serialized_content), message)
-	}
+	root_path = strings.TrimSuffix(root_path, ".db")
 
-	return proto.Unmarshal(serialized_content, message)
+	return filepath.Walk(root_path,
+		func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+
+			if info.IsDir() {
+				return nil
+			}
+
+			// We are only interested in filenames that end with .db
+			basename := info.Name()
+			if !strings.HasSuffix(basename, ".db") {
+				return nil
+			}
+
+			urn, err := FilenameToURN(config_obj, path)
+			if err != nil {
+				return err
+			}
+
+			return walkFn(urn)
+		})
 }
 
 func (self *FileBaseDataStore) SetSubject(
-	config_obj *api_proto.Config,
+	config_obj *config_proto.Config,
 	urn string,
 	message proto.Message) error {
 
 	// Encode as JSON
 	if strings.HasSuffix(urn, ".json") {
-		marshaler := &jsonpb.Marshaler{Indent: " "}
-		serialized_content, err := marshaler.MarshalToString(
-			message)
+		serialized_content, err := protojson.Marshal(message)
 		if err != nil {
 			return err
 		}
-		return writeContentToFile(
-			config_obj, urn, []byte(serialized_content))
+		return writeContentToFile(config_obj, urn, serialized_content)
 	}
 	serialized_content, err := proto.Marshal(message)
 	if err != nil {
@@ -187,7 +225,7 @@ func (self *FileBaseDataStore) SetSubject(
 }
 
 func (self *FileBaseDataStore) DeleteSubject(
-	config_obj *api_proto.Config,
+	config_obj *config_proto.Config,
 	urn string) error {
 
 	filename, err := urnToFilename(config_obj, urn)
@@ -206,14 +244,14 @@ func (self *FileBaseDataStore) DeleteSubject(
 	return nil
 }
 
-func listChildren(config_obj *api_proto.Config,
+func listChildren(config_obj *config_proto.Config,
 	urn string) ([]os.FileInfo, error) {
 	filename, err := urnToFilename(config_obj, urn)
 	if err != nil {
 		return nil, err
 	}
 	dirname := strings.TrimSuffix(filename, ".db")
-	children, err := ioutil.ReadDir(dirname)
+	children, err := utils.ReadDirUnsorted(dirname)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return []os.FileInfo{}, nil
@@ -225,19 +263,31 @@ func listChildren(config_obj *api_proto.Config,
 
 // Lists all the children of a URN.
 func (self *FileBaseDataStore) ListChildren(
-	config_obj *api_proto.Config,
+	config_obj *config_proto.Config,
 	urn string,
 	offset uint64, length uint64) ([]string, error) {
-	result := []string{}
-
-	children, err := listChildren(config_obj, urn)
+	all_children, err := listChildren(config_obj, urn)
 	if err != nil {
-		return result, err
+		return nil, err
 	}
+
+	// In the same directory we may have files and directories -
+	// in here we only care about the files which have a .db
+	// extension so filter the directory listing.
+	children := make([]os.FileInfo, 0, len(all_children))
+	for _, child := range all_children {
+		if strings.HasSuffix(child.Name(), ".db") {
+			children = append(children, child)
+		}
+	}
+
+	// Sort entries by modified time.
 	sort.Slice(children, func(i, j int) bool {
-		return children[i].ModTime().Unix() > children[j].ModTime().Unix()
+		return children[i].ModTime().UnixNano() < children[j].ModTime().UnixNano()
 	})
 
+	// Slice the result according to the required offset and count.
+	result := make([]string, 0, len(children))
 	urn = strings.TrimSuffix(urn, "/")
 	for i := offset; i < offset+length; i++ {
 		if i >= uint64(len(children)) {
@@ -245,27 +295,24 @@ func (self *FileBaseDataStore) ListChildren(
 		}
 
 		name := UnsanitizeComponent(children[i].Name())
-		if !strings.HasSuffix(name, ".db") {
-			continue
-		}
-		result = append(
-			result,
-			urn+"/"+strings.TrimSuffix(name, ".db"))
+		name = strings.TrimSuffix(name, ".db")
+		result = append(result, utils.PathJoin(urn, name, "/"))
 	}
+
 	return result, nil
 }
 
 // Update the posting list index. Searching for any of the
 // keywords will return the entity urn.
 func (self *FileBaseDataStore) SetIndex(
-	config_obj *api_proto.Config,
+	config_obj *config_proto.Config,
 	index_urn string,
 	entity string,
 	keywords []string) error {
 
 	for _, keyword := range keywords {
 		subject := path.Join(index_urn, strings.ToLower(keyword), entity)
-		err := writeContentToFile(config_obj, subject, []byte{})
+		err := self.SetSubject(config_obj, subject, &empty.Empty{})
 		if err != nil {
 			return err
 		}
@@ -274,7 +321,7 @@ func (self *FileBaseDataStore) SetIndex(
 }
 
 func (self *FileBaseDataStore) UnsetIndex(
-	config_obj *api_proto.Config,
+	config_obj *config_proto.Config,
 	index_urn string,
 	entity string,
 	keywords []string) error {
@@ -290,7 +337,7 @@ func (self *FileBaseDataStore) UnsetIndex(
 }
 
 func (self *FileBaseDataStore) CheckIndex(
-	config_obj *api_proto.Config,
+	config_obj *config_proto.Config,
 	index_urn string,
 	entity string,
 	keywords []string) error {
@@ -308,16 +355,31 @@ func (self *FileBaseDataStore) CheckIndex(
 }
 
 func (self *FileBaseDataStore) SearchClients(
-	config_obj *api_proto.Config,
+	config_obj *config_proto.Config,
 	index_urn string,
 	query string, query_type string,
-	offset uint64, limit uint64) []string {
+	offset uint64, limit uint64, sort_direction SortingSense) []string {
+
 	seen := make(map[string]bool)
-	result := []string{}
+
+	var result []string
+
+	if sort_direction == UNSORTED {
+		result = make([]string, 0, offset+limit)
+	}
 
 	query = strings.ToLower(query)
 	if query == "." || query == "" {
 		query = "all"
+	}
+
+	// If the result set is not sorted we can quit as soon as we
+	// have enough results. When sorting the results we are forced
+	// to enumerate all the clients, sort them and then chop them
+	// up into pages.
+	can_quit_early := func() bool {
+		return sort_direction == UNSORTED &&
+			uint64(len(result)) > offset+limit
 	}
 
 	add_func := func(key string) {
@@ -328,11 +390,15 @@ func (self *FileBaseDataStore) SearchClients(
 		}
 
 		for _, child_urn := range children {
-			name := strings.TrimSuffix(
-				UnsanitizeComponent(child_urn.Name()), ".db")
-			seen[name] = true
+			name := UnsanitizeComponent(child_urn.Name())
+			name = strings.TrimSuffix(name, ".db")
+			_, pres := seen[name]
+			if !pres {
+				seen[name] = true
+				result = append(result, name)
+			}
 
-			if uint64(len(seen)) > offset+limit {
+			if can_quit_early() {
 				break
 			}
 		}
@@ -346,10 +412,14 @@ func (self *FileBaseDataStore) SearchClients(
 		if err != nil {
 			return result
 		}
-		for _, set := range sets {
-			name := strings.TrimSuffix(
-				UnsanitizeComponent(set.Name()), ".db")
 
+		if sort_direction != UNSORTED {
+			result = make([]string, 0, len(sets))
+		}
+
+		for _, set := range sets {
+			name := UnsanitizeComponent(set.Name())
+			name = strings.TrimSuffix(name, ".db")
 			matched, err := path.Match(query, name)
 			if err != nil {
 				// Can only happen if pattern is invalid.
@@ -357,13 +427,17 @@ func (self *FileBaseDataStore) SearchClients(
 			}
 			if matched {
 				if query_type == "key" {
-					seen[name] = true
+					_, pres := seen[name]
+					if !pres {
+						seen[name] = true
+						result = append(result, name)
+					}
 				} else {
 					add_func(name)
 				}
 			}
 
-			if uint64(len(seen)) > offset+limit {
+			if can_quit_early() {
 				break
 			}
 		}
@@ -371,14 +445,24 @@ func (self *FileBaseDataStore) SearchClients(
 		add_func(query)
 	}
 
-	for k := range seen {
-		result = append(result, k)
-	}
-
+	// No results within the range.
 	if uint64(len(result)) < offset {
 		return []string{}
 	}
 
+	// Sort the search results for stable pagination output.
+	switch sort_direction {
+	case SORT_DOWN:
+		sort.Slice(result, func(i, j int) bool {
+			return result[i] > result[j]
+		})
+	case SORT_UP:
+		sort.Slice(result, func(i, j int) bool {
+			return result[i] < result[j]
+		})
+	}
+
+	// Clamp the limit to the end of the results we have.
 	if uint64(len(result))-offset < limit {
 		limit = uint64(len(result)) - offset
 	}
@@ -388,14 +472,6 @@ func (self *FileBaseDataStore) SearchClients(
 
 // Called to close all db handles etc. Not thread safe.
 func (self *FileBaseDataStore) Close() {}
-
-func init() {
-	db := FileBaseDataStore{
-		clock: testing.RealClock{},
-	}
-
-	RegisterImplementation("FileBaseDataStore", &db)
-}
 
 var hexTable = []rune("0123456789ABCDEF")
 
@@ -477,17 +553,14 @@ func UnsanitizeComponent(component_str string) string {
 	}
 }
 
-func urnToFilename(config_obj *api_proto.Config, urn string) (string, error) {
-	if config_obj.Datastore.Location == "" {
+func urnToFilename(config_obj *config_proto.Config, urn string) (string, error) {
+	if config_obj.Datastore == nil ||
+		config_obj.Datastore.Location == "" {
 		return "", errors.New("No Datastore_location is set in the config.")
 	}
 
 	components := []string{config_obj.Datastore.Location}
-	for idx, component := range strings.Split(urn, "/") {
-		if idx == 0 && component == "aff4:" {
-			continue
-		}
-
+	for _, component := range utils.SplitComponents(urn) {
 		components = append(components, string(SanitizeString(component)))
 	}
 
@@ -504,10 +577,12 @@ func urnToFilename(config_obj *api_proto.Config, urn string) (string, error) {
 		return "\\\\?\\" + result, nil
 	}
 
+	// fmt.Printf("Accessing on %v\n", result)
+
 	return result, nil
 }
 
-func writeContentToFile(config_obj *api_proto.Config, urn string, data []byte) error {
+func writeContentToFile(config_obj *config_proto.Config, urn string, data []byte) error {
 	filename, err := urnToFilename(config_obj, urn)
 	if err != nil {
 		return err
@@ -517,8 +592,14 @@ func writeContentToFile(config_obj *api_proto.Config, urn string, data []byte) e
 
 	// Try to create intermediate directories and try again.
 	if err != nil && os.IsNotExist(err) {
-		os.MkdirAll(filepath.Dir(filename), 0700)
+		err = os.MkdirAll(filepath.Dir(filename), 0700)
+		if err != nil {
+			return err
+		}
 		file, err = os.OpenFile(filename, os.O_RDWR|os.O_CREATE, 0660)
+		if err != nil {
+			return err
+		}
 	}
 	if err != nil {
 		logging.GetLogger(config_obj, &logging.FrontendComponent).Error(
@@ -527,7 +608,10 @@ func writeContentToFile(config_obj *api_proto.Config, urn string, data []byte) e
 	}
 	defer file.Close()
 
-	file.Truncate(0)
+	err = file.Truncate(0)
+	if err != nil {
+		return err
+	}
 
 	_, err = file.Write(data)
 	if err != nil {
@@ -537,7 +621,7 @@ func writeContentToFile(config_obj *api_proto.Config, urn string, data []byte) e
 }
 
 func readContentFromFile(
-	config_obj *api_proto.Config, urn string,
+	config_obj *config_proto.Config, urn string,
 	must_exist bool) ([]byte, error) {
 	filename, err := urnToFilename(config_obj, urn)
 	if err != nil {
@@ -545,36 +629,40 @@ func readContentFromFile(
 	}
 
 	file, err := os.Open(filename)
-	if err != nil {
-		if !must_exist && os.IsNotExist(err) {
-			return []byte{}, nil
-		}
-		return nil, errors.WithStack(err)
-	}
-	defer file.Close()
+	if err == nil {
+		defer file.Close()
 
-	result, err := ioutil.ReadAll(
-		io.LimitReader(file, constants.MAX_MEMORY))
-	return result, errors.WithStack(err)
+		result, err := ioutil.ReadAll(
+			io.LimitReader(file, constants.MAX_MEMORY))
+		return result, errors.WithStack(err)
+	}
+
+	// Its ok if the file does not exist - no error.
+	if !must_exist && os.IsNotExist(err) {
+		return []byte{}, nil
+	}
+	return nil, errors.WithStack(err)
 }
 
 // Convert a file name from the data store to a urn.
-func FilenameToURN(config_obj *api_proto.Config, filename string) (*string, error) {
-	if config_obj.Datastore.Implementation != "FileBaseDataStore" {
-		return nil, errors.New("Unsupported data store")
+func FilenameToURN(config_obj *config_proto.Config, filename string) (string, error) {
+	if runtime.GOOS == "windows" {
+		filename = strings.TrimPrefix(filename, WINDOWS_LFN_PREFIX)
 	}
 
-	if !strings.HasPrefix(filename, config_obj.Datastore.Location) {
-		return nil, errors.New("Filename is not within the FileBaseDataStore location.")
-	}
+	filename = strings.TrimPrefix(
+		filename, config_obj.Datastore.FilestoreDirectory)
 
-	location := strings.TrimSuffix(config_obj.Datastore.Location, "/")
 	components := []string{}
 	for _, component := range strings.Split(
-		strings.TrimPrefix(filename, location), "/") {
-		components = append(components, UnsanitizeComponent(component))
+		filename,
+		string(os.PathSeparator)) {
+		component = strings.TrimSuffix(component, ".db")
+		components = append(components,
+			string(UnsanitizeComponent(component)))
 	}
 
-	result := strings.TrimSuffix("aff4:"+strings.Join(components, "/"), ".db")
-	return &result, nil
+	// Filestore filenames always use / as separator.
+	result := utils.JoinComponents(components, "/")
+	return result, nil
 }

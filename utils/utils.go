@@ -23,11 +23,17 @@ import (
 	"reflect"
 	"strings"
 
+	"github.com/Velocidex/ordereddict"
+	"github.com/golang/protobuf/jsonpb"
+	"github.com/golang/protobuf/proto"
+	errors "github.com/pkg/errors"
+	vjson "www.velocidex.com/golang/velociraptor/json"
 	"www.velocidex.com/golang/vfilter"
+	"www.velocidex.com/golang/vfilter/types"
 )
 
-func InString(hay *[]string, needle string) bool {
-	for _, x := range *hay {
+func InString(hay []string, needle string) bool {
+	for _, x := range hay {
 		if x == needle {
 			return true
 		}
@@ -36,21 +42,18 @@ func InString(hay *[]string, needle string) bool {
 	return false
 }
 
-func IsNil(a interface{}) bool {
-	defer func() { recover() }()
-	return a == nil || reflect.ValueOf(a).IsNil()
-}
-
-// Massage a windows path into a standard form:
-// \ are replaced with /
-// Drive letters are preceeded with /
-// Example: c:\windows ->  /c:/windows
-func Normalize_windows_path(filename string) string {
-	filename = strings.Replace(filename, "\\", "/", -1)
-	if !strings.HasPrefix(filename, "/") {
-		filename = "/" + filename
+func StringSliceEq(a []string, b []string) bool {
+	if len(a) != len(b) {
+		return false
 	}
-	return filename
+
+	for i := 0; i < len(a); i++ {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+
+	return true
 }
 
 func hard_wrap(text string, colBreak int) string {
@@ -68,7 +71,7 @@ func hard_wrap(text string, colBreak int) string {
 	return wrapped
 }
 
-func Stringify(value interface{}, scope *vfilter.Scope, min_width int) string {
+func Stringify(value interface{}, scope vfilter.Scope, min_width int) string {
 	// Deal with pointers to things as those things.
 	if reflect.TypeOf(value).Kind() == reflect.Ptr {
 		return Stringify(reflect.Indirect(
@@ -89,7 +92,7 @@ func Stringify(value interface{}, scope *vfilter.Scope, min_width int) string {
 	}
 
 	json_marshall := func(value interface{}) string {
-		if k, err := json.Marshal(value); err == nil {
+		if k, err := vjson.Marshal(value); err == nil {
 			if len(k) > 0 && k[0] == '"' && k[len(k)-1] == '"' {
 				k = k[1 : len(k)-1]
 			}
@@ -100,13 +103,9 @@ func Stringify(value interface{}, scope *vfilter.Scope, min_width int) string {
 	}
 
 	switch t := value.(type) {
-	case vfilter.Dict:
-		result := []string{}
-		iter := t.IterFunc()
-		for kv, ok := iter(); ok; kv, ok = iter() {
-			result = append(result, fmt.Sprintf("%v: %v", kv.Key, kv.Value))
-		}
-		return strings.Join(result, "\n")
+
+	case ordereddict.Dict:
+		return t.String()
 
 	case map[string]interface{}:
 		result := []string{}
@@ -115,7 +114,7 @@ func Stringify(value interface{}, scope *vfilter.Scope, min_width int) string {
 		}
 		return strings.Join(result, "\n")
 
-	case vfilter.StringProtocol:
+	case types.StringProtocol:
 		return t.ToString(scope)
 
 	case []byte:
@@ -150,4 +149,53 @@ func SlicesEqual(a []string, b []string) bool {
 	}
 
 	return true
+}
+
+// Force coersion to int64
+func ToInt64(x interface{}) (int64, bool) {
+	switch t := x.(type) {
+	case bool:
+		if t {
+			return 1, true
+		} else {
+			return 0, true
+		}
+	case int:
+		return int64(t), true
+	case uint8:
+		return int64(t), true
+	case int8:
+		return int64(t), true
+	case uint16:
+		return int64(t), true
+	case int16:
+		return int64(t), true
+	case uint32:
+		return int64(t), true
+	case int32:
+		return int64(t), true
+	case uint64:
+		return int64(t), true
+	case int64:
+		return t, true
+	case float64:
+		return int64(t), true
+
+	default:
+		return 0, false
+	}
+}
+
+func ParseIntoProtobuf(source interface{}, destination proto.Message) error {
+	if source == nil {
+		return errors.New("Nil")
+	}
+
+	serialized, err := json.Marshal(source)
+	if err != nil {
+		return err
+	}
+
+	return jsonpb.UnmarshalString(
+		string(serialized), destination)
 }

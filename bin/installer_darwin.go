@@ -27,10 +27,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 
 	errors "github.com/pkg/errors"
 	kingpin "gopkg.in/alecthomas/kingpin.v2"
-	config "www.velocidex.com/golang/velociraptor/config"
 	"www.velocidex.com/golang/velociraptor/logging"
 	"www.velocidex.com/golang/velociraptor/utils"
 )
@@ -45,9 +45,14 @@ var (
 )
 
 func doRemove() error {
-	config_obj, err := config.LoadClientConfig(*config_path)
+	config_obj, err := DefaultConfigLoader.WithRequiredClient().
+		WithWriteback().LoadAndValidate()
 	if err != nil {
 		return errors.Wrap(err, "Unable to load config file")
+	}
+
+	if config_obj.Client.DarwinInstaller == nil {
+		return errors.New("DarwinInstaller not configured")
 	}
 
 	service_name := config_obj.Client.DarwinInstaller.ServiceName
@@ -60,7 +65,8 @@ func doRemove() error {
 }
 
 func doInstall() error {
-	config_obj, err := config.LoadClientConfig(*config_path)
+	config_obj, err := DefaultConfigLoader.WithRequiredClient().
+		WithWriteback().LoadAndValidate()
 	if err != nil {
 		return errors.Wrap(err, "Unable to load config file")
 	}
@@ -72,8 +78,11 @@ func doInstall() error {
 	logger := logging.GetLogger(config_obj, &logging.ClientComponent)
 	target_path := os.ExpandEnv(config_obj.Client.DarwinInstaller.InstallPath)
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	// Try to copy the executable to the target_path.
-	err = utils.CopyFile(executable, target_path, 0755)
+	err = utils.CopyFile(ctx, executable, target_path, 0755)
 	if err != nil && os.IsNotExist(errors.Cause(err)) {
 		dirname := filepath.Dir(target_path)
 		logger.Info("Attempting to create intermediate directory %s.",
@@ -82,13 +91,30 @@ func doInstall() error {
 		if err != nil {
 			return errors.Wrap(err, "Create intermediate directories")
 		}
-		err = utils.CopyFile(executable, target_path, 0755)
+		err = utils.CopyFile(ctx, executable, target_path, 0755)
 	}
 	if err != nil {
 		return errors.Wrap(err, "Cant copy binary into destination dir.")
 	}
 
 	logger.Info("Copied binary to %s", target_path)
+
+	// If the installer was invoked with the --config arg then we
+	// need to copy the config to the target path.
+	if *config_path != "" {
+		config_target_path := strings.TrimSuffix(
+			target_path, filepath.Ext(target_path)) + ".config.yaml"
+
+		logger.Info("Copying config to destination %s",
+			config_target_path)
+
+		err = utils.CopyFile(ctx, *config_path, config_target_path, 0755)
+		if err != nil {
+			logger.Info("Cant copy config to destination %s: %v",
+				config_target_path, err)
+			return err
+		}
+	}
 
 	plist_path := "/Library/LaunchDaemons/" + service_name + ".plist"
 	plist := fmt.Sprintf(`
@@ -102,11 +128,13 @@ func doInstall() error {
         <array>
                 <string>%v</string>
                 <string>client</string>
+                <string>--config</string>
+                <string>%v.config.yaml</string>
         </array>
         <key>KeepAlive</key>
         <true/>
 </dict>
-</plist>`, service_name, target_path)
+</plist>`, service_name, target_path, target_path)
 
 	err = ioutil.WriteFile(plist_path, []byte(plist), 0644)
 	kingpin.FatalIfError(err, "Can't write plist file.")

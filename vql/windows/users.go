@@ -25,6 +25,8 @@ import (
 	"syscall"
 	"unsafe"
 
+	"github.com/Velocidex/ordereddict"
+	"www.velocidex.com/golang/velociraptor/acls"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	vfilter "www.velocidex.com/golang/vfilter"
 )
@@ -99,8 +101,8 @@ func ParseUserRecord(a *USER_INFO_3) *UserRecord {
 	}
 }
 
-func getUsers(scope *vfilter.Scope,
-	args *vfilter.Dict) []vfilter.Row {
+func getUsers(scope vfilter.Scope,
+	args *ordereddict.Dict) []vfilter.Row {
 	var result []vfilter.Row
 
 	level := uint32(3)
@@ -146,10 +148,17 @@ type LookupSidFunctionArgs struct {
 type LookupSidFunction struct{}
 
 func (self *LookupSidFunction) Call(ctx context.Context,
-	scope *vfilter.Scope,
-	args *vfilter.Dict) vfilter.Any {
+	scope vfilter.Scope,
+	args *ordereddict.Dict) vfilter.Any {
+
+	err := vql_subsystem.CheckAccess(scope, acls.MACHINE_STATE)
+	if err != nil {
+		scope.Log("LookupSID: %s", err)
+		return false
+	}
+
 	arg := &LookupSidFunctionArgs{}
-	err := vfilter.ExtractArgs(scope, args, arg)
+	err = vfilter.ExtractArgs(scope, args, arg)
 	if err != nil {
 		scope.Log("LookupSID: %s", err.Error())
 		return false
@@ -177,11 +186,11 @@ func (self *LookupSidFunction) Call(ctx context.Context,
 	return syscall.UTF16ToString(name)
 }
 
-func (self *LookupSidFunction) Info(scope *vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
+func (self *LookupSidFunction) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
 		Name:    "lookupSID",
 		Doc:     "Get information about the SID.",
-		ArgType: type_map.AddType(scope, &LookupSidFunction{}),
+		ArgType: type_map.AddType(scope, &LookupSidFunctionArgs{}),
 	}
 }
 
@@ -191,7 +200,6 @@ func init() {
 		Doc: "Display information about workstation local users. " +
 			"This is obtained through the NetUserEnum() API.",
 		Function: getUsers,
-		RowType:  UserRecord{},
 	})
 
 	vql_subsystem.RegisterFunction(&LookupSidFunction{})

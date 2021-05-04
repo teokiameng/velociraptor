@@ -21,6 +21,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/Velocidex/ordereddict"
 	humanize "github.com/dustin/go-humanize"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
@@ -33,8 +34,8 @@ type HumanizeArgs struct {
 type HumanizeFunction struct{}
 
 func (self *HumanizeFunction) Call(ctx context.Context,
-	scope *vfilter.Scope,
-	args *vfilter.Dict) vfilter.Any {
+	scope vfilter.Scope,
+	args *ordereddict.Dict) vfilter.Any {
 	arg := &HumanizeArgs{}
 	err := vfilter.ExtractArgs(scope, args, arg)
 	if err != nil {
@@ -49,7 +50,7 @@ func (self *HumanizeFunction) Call(ctx context.Context,
 	return fmt.Sprintf("%v", arg.Bytes)
 }
 
-func (self HumanizeFunction) Info(scope *vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
+func (self HumanizeFunction) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
 		Name:    "humanize",
 		Doc:     "Format items in human readable way.",

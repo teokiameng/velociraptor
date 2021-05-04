@@ -18,6 +18,9 @@ parameters:
     default: "%SYSTEMROOT%/appcompat/Programs/Amcache.hve"
   - name: amCacheRegPath
     default: /Root/InventoryApplicationFile/*
+  - name: NTFS_CACHE_SIZE
+    type: int
+    default: 1000
 
 precondition: |
   SELECT OS From info() where OS = 'windows'
@@ -28,8 +31,7 @@ sources:
       - |
         SELECT FileId,
                Key.FullPath as Key,
-               timestamp(epoch=Key.Mtime.Sec) as LastModified,
-               Key.Mtime.Sec as _LastModified,
+               Key.Mtime as LastModified,
                LowerCaseLongPath as Binary,
                Name,
                Size,
@@ -40,9 +42,10 @@ sources:
         FROM foreach(
           row={
             SELECT FullPath from glob(globs=expand(path=amCacheGlob))
+            WHERE log(message="Processing "+FullPath)
           }, query={
             SELECT * from read_reg_key(
-               globs=url(scheme='ntfs', path=FullPath,
+               globs=url(scheme='file', path=FullPath,
                          fragment=amCacheRegPath).String,
                accessor='raw_reg'
             )
@@ -58,9 +61,9 @@ sources:
             SELECT get(item=scope(), member="100") As ProductId,
                    get(item=scope(), member="101") As SHA1,
                    get(item=scope(), member="15") As FullPath,
-                   timestamp(epoch=Key.Mtime.Sec) as LastModifiedKey
+                   Key.Mtime as LastModifiedKey
             FROM read_reg_key(
-               globs=url(scheme='ntfs', path=FullPath,
+               globs=url(scheme='file', path=FullPath,
                          fragment='/Root/File/*/*').String,
                accessor='raw_reg'
             )

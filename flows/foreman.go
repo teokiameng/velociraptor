@@ -38,79 +38,61 @@ package flows
 import (
 	"context"
 
+	"github.com/Velocidex/ordereddict"
 	errors "github.com/pkg/errors"
 	actions_proto "www.velocidex.com/golang/velociraptor/actions/proto"
 	api_proto "www.velocidex.com/golang/velociraptor/api/proto"
-	artifacts "www.velocidex.com/golang/velociraptor/artifacts"
+	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	constants "www.velocidex.com/golang/velociraptor/constants"
 	crypto_proto "www.velocidex.com/golang/velociraptor/crypto/proto"
-	"www.velocidex.com/golang/velociraptor/grpc_client"
-	"www.velocidex.com/golang/velociraptor/responder"
 	"www.velocidex.com/golang/velociraptor/services"
-	urns "www.velocidex.com/golang/velociraptor/urns"
 )
 
-type Foreman struct {
-	BaseFlow
-}
+// ForemanProcessMessage processes a ForemanCheckin message from the
+// client.
+func ForemanProcessMessage(
+	ctx context.Context,
+	config_obj *config_proto.Config,
+	client_id string,
+	foreman_checkin *actions_proto.ForemanCheckin) error {
 
-func (self *Foreman) New() Flow {
-	return &Foreman{BaseFlow{}}
-}
+	if foreman_checkin == nil {
+		return errors.New("Expected args of type ForemanCheckin")
+	}
 
-func (self *Foreman) ProcessEventTables(
-	config_obj *api_proto.Config,
-	flow_obj *AFF4FlowObject,
-	source string,
-	arg *actions_proto.ForemanCheckin) error {
-
-	// Need to update client's event table.
-	if arg.LastEventTableVersion < services.GetClientEventsVersion() {
-		channel := grpc_client.GetChannel(config_obj)
-		defer channel.Close()
-
-		client := api_proto.NewAPIClient(channel)
-		flow_runner_args := services.GetClientEventsFlowRunnerArgs()
-		flow_runner_args.Creator = "Foreman"
-		flow_runner_args.ClientId = source
-		_, err := client.LaunchFlow(context.Background(), flow_runner_args)
+	// Update the client's event tables.
+	client_event_manager := services.ClientEventManager()
+	if client_event_manager != nil &&
+		client_event_manager.CheckClientEventsVersion(
+			config_obj, client_id,
+			foreman_checkin.LastEventTableVersion) {
+		err := QueueMessageForClient(
+			config_obj, client_id,
+			client_event_manager.GetClientUpdateEventTableMessage(
+				config_obj, client_id))
 		if err != nil {
 			return err
 		}
 	}
 
-	return nil
-}
-
-func (self *Foreman) ProcessMessage(
-	config_obj *api_proto.Config,
-	flow_obj *AFF4FlowObject,
-	message *crypto_proto.GrrMessage) error {
-	foreman_checkin, ok := responder.ExtractGrrMessagePayload(
-		message).(*actions_proto.ForemanCheckin)
-	if !ok {
-		return errors.New("Expected args of type ForemanCheckin")
-	}
-
-	// Update the client's event tables.
-	err := self.ProcessEventTables(config_obj, flow_obj, message.Source,
-		foreman_checkin)
-	if err != nil {
-		return err
-	}
-
 	// Process any needed hunts.
 	dispatcher := services.GetHuntDispatcher()
+	if dispatcher == nil {
+		return nil
+	}
 	client_last_timestamp := foreman_checkin.LastHuntTimestamp
 
-	// Can we get away without a lock?
+	// Can we get away without a lock? If the client is already up
+	// to date we dont need to look further.
 	hunts_last_timestamp := dispatcher.GetLastTimestamp()
 	if client_last_timestamp >= hunts_last_timestamp {
 		return nil
 	}
 
-	// Nop - we need to lock and examine the hunts more carefully.
-	return dispatcher.ApplyFuncOnHunts(func(hunt *api_proto.Hunt) error {
+	// Take a snapshot of the hunts that we need to run on this
+	// client to reduce the time under lock.
+	hunts := make([]*api_proto.Hunt, 0)
+	err := dispatcher.ApplyFuncOnHunts(func(hunt *api_proto.Hunt) error {
 		// Hunt is stopped we dont care about it.
 		if hunt.State != api_proto.Hunt_RUNNING {
 			return nil
@@ -121,64 +103,59 @@ func (self *Foreman) ProcessMessage(
 			return nil
 		}
 
-		flow_condition_query, err := calculateFlowConditionQuery(
-			config_obj, hunt)
-		if err != nil {
-			return err
-		}
+		// Take a snapshot of the hunt id and start time.
+		hunts = append(hunts, &api_proto.Hunt{
+			HuntId:    hunt.HuntId,
+			StartTime: hunt.StartTime,
+		})
 
-		urn := urns.BuildURN(
-			"clients", message.Source,
-			"flows", constants.MONITORING_WELL_KNOWN_FLOW)
-
-		err = QueueAndNotifyClient(
-			config_obj, message.Source, urn,
-			"VQLClientAction",
-			flow_condition_query,
-			processVQLResponses)
-		if err != nil {
-			return err
-		}
-
-		err = QueueAndNotifyClient(
-			config_obj, message.Source, urn,
-			"UpdateForeman",
-			&actions_proto.ForemanCheckin{
-				LastHuntTimestamp: hunt.StartTime,
-			}, constants.IgnoreResponseState)
-		if err != nil {
-			return err
-		}
 		return nil
 	})
-}
 
-func calculateFlowConditionQuery(
-	config_obj *api_proto.Config,
-	hunt *api_proto.Hunt) (
-	*actions_proto.VQLCollectorArgs, error) {
-
-	// TODO.
-
-	default_query := getDefaultCollectorArgs(hunt.HuntId)
-	err := artifacts.Obfuscate(config_obj, default_query)
-	return default_query, err
-}
-
-func getDefaultCollectorArgs(hunt_id string) *actions_proto.VQLCollectorArgs {
-	return &actions_proto.VQLCollectorArgs{
-		Env: []*actions_proto.VQLEnv{
-			&actions_proto.VQLEnv{
-				Key:   "HuntId",
-				Value: hunt_id,
-			},
-		},
-		Query: []*actions_proto.VQLRequest{
-			&actions_proto.VQLRequest{
-				Name: "System.Hunt.Participation",
-				VQL: "SELECT now() as Timestamp, Fqdn, HuntId, " +
-					"true as Participate from info()",
-			},
-		},
+	// Nothing to do, return
+	if len(hunts) == 0 {
+		return err
 	}
+
+	// Now schedule the client for all the hunts that it needs to run.
+	journal, err := services.GetJournal()
+	if err != nil {
+		return err
+	}
+
+	// Record the latest timestamp
+	latest_timestamp := uint64(0)
+	for _, hunt := range hunts {
+		// Notify the hunt manager that we need to hunt this client.
+		err = journal.PushRowsToArtifact(config_obj,
+			[]*ordereddict.Dict{ordereddict.NewDict().
+				Set("HuntId", hunt.HuntId).
+				Set("ClientId", client_id),
+			}, "System.Hunt.Participation", client_id, "")
+		if err != nil {
+			return err
+		}
+
+		if hunt.StartTime > latest_timestamp {
+			latest_timestamp = hunt.StartTime
+		}
+	}
+
+	// Let the client know it needs to update its foreman state to
+	// the latest time. We schedule an UpdateForeman message for
+	// the client. Note that it is possible that the client does
+	// not update its timestamp immediately and therefore might
+	// end up sending multiple participation events to the hunt
+	// manager - this is ok since the hunt manager keeps hunt
+	// participation index and will automatically skip multiple
+	// messages.
+	return QueueMessageForClient(
+		config_obj, client_id,
+		&crypto_proto.VeloMessage{
+			SessionId: constants.MONITORING_WELL_KNOWN_FLOW,
+			RequestId: constants.IgnoreResponseState,
+			UpdateForeman: &actions_proto.ForemanCheckin{
+				LastHuntTimestamp: latest_timestamp,
+			},
+		})
 }

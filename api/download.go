@@ -15,317 +15,63 @@
    You should have received a copy of the GNU Affero General Public License
    along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
-// Implement downloads. For now we do not use gRPC for this but
-// implement it directly in the API.
+
+// Implement downloads. We do not use gRPC for this but implement it
+// directly in the API.
+
+// NOTE: Most Downloads are now split into two phases - the first is
+// creation performed by the vql functions create_flow_download() and
+// create_hunt_download(). The GUI can then fetch them directly
+// through a file store handler installed on the "/downloads/" path.
 package api
 
 import (
 	"archive/zip"
 	"io"
+	"io/ioutil"
 	"net/http"
 	"net/url"
 	"os"
 	"path"
+	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
-	"github.com/golang/protobuf/jsonpb"
+	"github.com/Velocidex/ordereddict"
 	"github.com/gorilla/schema"
 	errors "github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
+	context "golang.org/x/net/context"
+	actions_proto "www.velocidex.com/golang/velociraptor/actions/proto"
 	api_proto "www.velocidex.com/golang/velociraptor/api/proto"
-	"www.velocidex.com/golang/velociraptor/artifacts"
+	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
+	"www.velocidex.com/golang/velociraptor/datastore"
 	"www.velocidex.com/golang/velociraptor/file_store"
 	"www.velocidex.com/golang/velociraptor/file_store/csv"
+	"www.velocidex.com/golang/velociraptor/file_store/result_sets"
 	"www.velocidex.com/golang/velociraptor/flows"
+	flows_proto "www.velocidex.com/golang/velociraptor/flows/proto"
+	"www.velocidex.com/golang/velociraptor/json"
 	"www.velocidex.com/golang/velociraptor/logging"
-	"www.velocidex.com/golang/vfilter"
+	"www.velocidex.com/golang/velociraptor/paths"
+	"www.velocidex.com/golang/velociraptor/paths/artifacts"
+	"www.velocidex.com/golang/velociraptor/services"
+	"www.velocidex.com/golang/velociraptor/utils"
+	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
+)
+
+var (
+	pool = sync.Pool{
+		New: func() interface{} {
+			return make([]byte, 32*1024)
+		},
+	}
 )
 
 func returnError(w http.ResponseWriter, code int, message string) {
 	w.WriteHeader(code)
-	w.Write([]byte(message))
-}
-
-func downloadFlowToZip(
-	config_obj *api_proto.Config,
-	client_id string,
-	flow_id string,
-	zip_writer *zip.Writer) error {
-
-	flow_details, err := flows.GetFlowDetails(config_obj, client_id, flow_id)
-	if err != nil {
-		return err
-	}
-	file_store_factory := file_store.GetFileStore(config_obj)
-
-	copier := func(upload_name string) error {
-		reader, err := file_store_factory.ReadFile(upload_name)
-		if err != nil {
-			return err
-		}
-		defer reader.Close()
-
-		// Clean the name so it makes a reasonable zip member.
-		upload_name = path.Clean(strings.Replace(
-			upload_name, "\\", "/", -1))
-		f, err := zip_writer.Create(upload_name)
-		if err != nil {
-			return err
-		}
-
-		_, err = io.Copy(f, reader)
-		if err != nil {
-			logger := logging.GetLogger(config_obj, &logging.GUIComponent)
-			logger.WithFields(logrus.Fields{
-				"flow_id":     flow_id,
-				"client_id":   client_id,
-				"upload_name": upload_name,
-			}).Error("Download Flow")
-		}
-		return err
-	}
-
-	// Copy the flow's logs.
-	copier(path.Join("clients", client_id, "flows", flow_id, "logs"))
-
-	// This basically copies the CSV files from the
-	// filestore into the zip. We do not need to do any
-	// processing - just give the user the files as they
-	// are. Users can do their own post processing.
-	for _, artifact_source := range flow_details.Context.ArtifactsWithResults {
-		artifact, source := artifacts.SplitFullSourceName(artifact_source)
-		copier(artifacts.GetCSVPath(
-			client_id, "", path.Base(flow_id),
-			artifact, source, artifacts.MODE_CLIENT))
-	}
-
-	// Get all file uploads
-	if flow_details.Context.TotalUploadedFiles == 0 {
-		return nil
-	}
-
-	// FIXME: Backwards compatibility.
-	for _, upload_name := range flow_details.Context.UploadedFiles {
-		copier(upload_name)
-	}
-
-	// File uploads are stored in their own CSV file.
-	file_path := artifacts.GetUploadsFile(client_id, path.Base(flow_id))
-	fd, err := file_store_factory.ReadFile(file_path)
-	if err != nil {
-		return err
-	}
-	defer fd.Close()
-
-	for row := range csv.GetCSVReader(fd) {
-		vfs_path_any, pres := row.Get("vfs_path")
-		if pres {
-			err = copier(vfs_path_any.(string))
-		}
-	}
-	return err
-}
-
-// URL format: /api/v1/download/<client_id>/<flow_id>
-func flowResultDownloadHandler(
-	config_obj *api_proto.Config) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		components := strings.Split(r.URL.Path, "/")
-		if len(components) < 2 {
-			returnError(w, 404, "Flow id should be specified.")
-			return
-		}
-		flow_id := components[len(components)-1]
-		client_id := components[len(components)-2]
-		flow_details, err := flows.GetFlowDetails(config_obj, client_id, flow_id)
-		if err != nil {
-			returnError(w, 404, err.Error())
-			return
-		}
-
-		// TODO: ACL checks.
-		if r.Method == "HEAD" {
-			returnError(w, 200, "Ok")
-			return
-		}
-
-		// From here on we already sent the headers and we can
-		// not really report an error to the client.
-		w.Header().Set("Content-Disposition", "attachment; filename="+
-			url.PathEscape(flow_id+".zip"))
-		w.Header().Set("Content-Type", "binary/octet-stream")
-		w.WriteHeader(200)
-
-		// Log an audit event.
-		userinfo := logging.GetUserInfo(r.Context(), config_obj)
-
-		// This should never happen!
-		if userinfo.Name == "" {
-			panic("Unauthenticated access.")
-		}
-
-		logging.GetLogger(config_obj, &logging.Audit).
-			WithFields(logrus.Fields{
-				"user":      userinfo.Name,
-				"flow_id":   flow_id,
-				"client_id": client_id,
-				"remote":    r.RemoteAddr,
-			}).Info("DownloadFlowResults")
-
-		marshaler := &jsonpb.Marshaler{Indent: " "}
-		flow_details_json, err := marshaler.MarshalToString(flow_details)
-		if err != nil {
-			return
-		}
-
-		zip_writer := zip.NewWriter(w)
-		defer zip_writer.Close()
-
-		f, err := zip_writer.Create("FlowDetails")
-		if err != nil {
-			return
-		}
-
-		_, err = f.Write([]byte(flow_details_json))
-		if err != nil {
-			return
-		}
-
-		downloadFlowToZip(config_obj, client_id, flow_id, zip_writer)
-	})
-}
-
-// URL format: /api/v1/DownloadHuntResults
-func huntResultDownloadHandler(
-	config_obj *api_proto.Config) http.Handler {
-
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		hunt_ids, pres := r.URL.Query()["hunt_id"]
-		if !pres || len(hunt_ids) == 0 {
-			returnError(w, 404, "Hunt id should be specified.")
-			return
-		}
-		hunt_id := path.Base(hunt_ids[0])
-
-		hunt_details, err := flows.GetHunt(
-			config_obj,
-			&api_proto.GetHuntRequest{HuntId: hunt_id})
-		if err != nil {
-			returnError(w, 404, err.Error())
-			return
-		}
-
-		// TODO: ACL checks.
-		if r.Method == "HEAD" {
-			returnError(w, 200, "Ok")
-			return
-		}
-
-		// From here on we sent the headers and we can not
-		// really report an error to the client.
-		w.Header().Set("Content-Disposition", "attachment; filename="+
-			url.PathEscape(hunt_id+".zip"))
-		w.Header().Set("Content-Type", "binary/octet-stream")
-		w.WriteHeader(200)
-
-		// Log an audit event.
-		userinfo := logging.GetUserInfo(r.Context(), config_obj)
-		logging.GetLogger(config_obj, &logging.Audit).
-			WithFields(logrus.Fields{
-				"user":    userinfo.Name,
-				"hunt_id": hunt_id,
-				"remote":  r.RemoteAddr,
-			}).Info("DownloadHuntResults")
-
-		// This should never happen!
-		if userinfo.Name == "" {
-			panic("Unauthenticated access.")
-		}
-
-		marshaler := &jsonpb.Marshaler{Indent: " "}
-		hunt_details_json, err := marshaler.MarshalToString(hunt_details)
-		if err != nil {
-			return
-		}
-
-		zip_writer := zip.NewWriter(w)
-		defer zip_writer.Close()
-
-		f, err := zip_writer.Create("HuntDetails")
-		if err != nil {
-			return
-		}
-
-		_, err = f.Write([]byte(hunt_details_json))
-		if err != nil {
-			return
-		}
-
-		// Export aggregate CSV files for all clients.
-		for _, artifact_source := range hunt_details.ArtifactSources {
-			artifact, source := artifacts.SplitFullSourceName(
-				artifact_source)
-
-			query := "SELECT * FROM hunt_results(" +
-				"hunt_id=HuntId, artifact=Artifact, " +
-				"source=Source, brief=true)"
-			env := vfilter.NewDict().
-				Set("Artifact", artifact).
-				Set("HuntId", hunt_id).
-				Set("Source", source)
-
-			f, err := zip_writer.Create("All " +
-				path.Join(artifact, source) + ".csv")
-			if err != nil {
-				continue
-			}
-
-			err = StoreVQLAsCSVFile(r.Context(), config_obj,
-				env, query, f)
-			if err != nil {
-				logging.GetLogger(config_obj, &logging.Audit).
-					WithFields(logrus.Fields{
-						"artifact": artifact,
-					}).Info("ExportHuntArtifact")
-			}
-		}
-
-		file_store_factory := file_store.GetFileStore(config_obj)
-		file_path := path.Join("hunts", hunt_id+".csv")
-		fd, err := file_store_factory.ReadFile(file_path)
-		if err != nil {
-			return
-		}
-		defer fd.Close()
-
-		for row := range csv.GetCSVReader(fd) {
-			flow_id_any, _ := row.Get("FlowId")
-			flow_id, ok := flow_id_any.(string)
-			if !ok {
-				continue
-			}
-			client_id_any, _ := row.Get("ClientId")
-			client_id, ok := client_id_any.(string)
-			if !ok {
-				continue
-			}
-
-			err := downloadFlowToZip(
-				config_obj,
-				client_id,
-				flow_id,
-				zip_writer)
-			if err != nil {
-				logging.GetLogger(config_obj, &logging.FrontendComponent).
-					WithFields(logrus.Fields{
-						"hunt_id": hunt_id,
-						"error":   err.Error(),
-						"bt":      logging.GetStackTrace(err),
-					}).Info("DownloadHuntResults")
-				continue
-			}
-		}
-	})
+	_, _ = w.Write([]byte(message))
 }
 
 type vfsFileDownloadRequest struct {
@@ -336,48 +82,9 @@ type vfsFileDownloadRequest struct {
 	Encoding string `schema:"encoding"`
 }
 
-func filestorePathForVFSPath(
-	config_obj *api_proto.Config,
-	client_id string,
-	vfs_path string) string {
-	vfs_path = path.Join("/", vfs_path)
-
-	// monitoring and artifacts vfs folders are in the client's
-	// space.
-	if strings.HasPrefix(vfs_path, "/monitoring/") ||
-		strings.HasPrefix(vfs_path, "/flows/") ||
-		strings.HasPrefix(vfs_path, "/artifacts/") {
-		return path.Join(
-			"clients", client_id, vfs_path)
-	}
-
-	// These VFS directories are mapped directly to the root of
-	// the filestore regardless of the client id.
-	if strings.HasPrefix(vfs_path, "/server_artifacts/") ||
-		strings.HasPrefix(vfs_path, "/hunts/") {
-		return vfs_path
-	}
-
-	// Other folders live inside the client's vfs_files subdir.
-	return path.Join(
-		"clients", client_id,
-		"vfs_files", vfs_path)
-}
-
-func getFileForVFSPath(
-	config_obj *api_proto.Config,
-	client_id string,
-	vfs_path string) (
-	file_store.ReadSeekCloser, error) {
-	vfs_path = path.Clean(vfs_path)
-
-	filestore_path := filestorePathForVFSPath(config_obj, client_id, vfs_path)
-	return file_store.GetFileStore(config_obj).ReadFile(filestore_path)
-}
-
 // URL format: /api/v1/DownloadVFSFile
 func vfsFileDownloadHandler(
-	config_obj *api_proto.Config) http.Handler {
+	config_obj *config_proto.Config) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		request := vfsFileDownloadRequest{}
 		decoder := schema.NewDecoder()
@@ -387,8 +94,7 @@ func vfsFileDownloadHandler(
 			return
 		}
 
-		file, err := getFileForVFSPath(
-			config_obj, request.ClientId, request.VfsPath)
+		file, err := file_store.GetFileStore(config_obj).ReadFile(request.VfsPath)
 		if err != nil {
 			returnError(w, 404, err.Error())
 			return
@@ -400,21 +106,34 @@ func vfsFileDownloadHandler(
 			return
 		}
 
-		file.Seek(request.Offset, 0)
+		var reader_at io.ReaderAt = &utils.ReaderAtter{Reader: file}
+
+		index, err := getIndex(config_obj, request.VfsPath)
+
+		// If the file is sparse, we use the sparse reader.
+		if err == nil && len(index.Ranges) > 0 {
+			reader_at = &utils.RangedReader{
+				ReaderAt: reader_at,
+				Index:    index,
+			}
+		}
+
+		offset := request.Offset
 
 		// From here on we sent the headers and we can not
 		// really report an error to the client.
-		filename := strings.Replace(path.Dir(request.VfsPath),
-			"\"", "_", -1)
+		filename := strings.Replace(request.VfsPath, "\"", "_", -1)
 		w.Header().Set("Content-Disposition", "attachment; filename="+
-			url.PathEscape(filename))
+			url.PathEscape(path.Base(filename)))
 		w.Header().Set("Content-Type", "binary/octet-stream")
 		w.WriteHeader(200)
 
 		length_sent := 0
-		buf := make([]byte, 64*1024)
+		buf := pool.Get().([]byte)
+		defer pool.Put(buf)
+
 		for {
-			n, _ := file.Read(buf)
+			n, _ := reader_at.ReadAt(buf, offset)
 			if n > 0 {
 				if request.Length != 0 {
 					length_to_send := request.Length - length_sent
@@ -422,12 +141,16 @@ func vfsFileDownloadHandler(
 						n = length_to_send
 					}
 				}
+				if n == 0 {
+					return
+				}
+
 				_, err := w.Write(buf[:n])
 				if err != nil {
 					return
 				}
 				length_sent += n
-
+				offset += int64(n)
 			} else {
 				return
 			}
@@ -435,9 +158,180 @@ func vfsFileDownloadHandler(
 	})
 }
 
+func getRSReader(
+	ctx context.Context,
+	config_obj *config_proto.Config,
+	request *api_proto.GetTableRequest) (result_sets.ResultSetReader, string, error) {
+	file_store_factory := file_store.GetFileStore(config_obj)
+
+	// We want an event table.
+	if request.Type == "CLIENT_EVENT" || request.Type == "SERVER_EVENT" {
+		path_manager, err := artifacts.NewArtifactPathManager(
+			config_obj, request.ClientId, request.FlowId,
+			request.Artifact)
+		if err != nil {
+			return nil, "", err
+		}
+
+		log_path, err := path_manager.GetPathForWriting()
+		if err != nil {
+			return nil, "", err
+		}
+
+		rs_reader, err := result_sets.NewTimedResultSetReader(
+			ctx, file_store_factory, path_manager,
+			request.StartTime, request.EndTime)
+
+		return rs_reader, log_path, err
+
+	} else {
+		path_manager, err := getPathManager(config_obj, request)
+		if err != nil {
+			return nil, "", err
+		}
+
+		log_path, err := path_manager.GetPathForWriting()
+		if err != nil {
+			return nil, "", err
+		}
+
+		rs_reader, err := result_sets.NewResultSetReader(
+			file_store_factory, path_manager)
+
+		return rs_reader, log_path, err
+	}
+}
+
+// The GUI transforms many of the raw tables we use - so when
+// exporting we need to replicate this transformation, otherwise the
+// results can be surprising.
+func getTransformer(
+	config_obj *config_proto.Config,
+	in *api_proto.GetTableRequest) func(row *ordereddict.Dict) *ordereddict.Dict {
+	if in.HuntId != "" && in.Type == "clients" {
+		return func(row *ordereddict.Dict) *ordereddict.Dict {
+			client_id := utils.GetString(row, "ClientId")
+			flow_id := utils.GetString(row, "FlowId")
+
+			flow, err := flows.LoadCollectionContext(config_obj, client_id, flow_id)
+			if err != nil {
+				flow = &flows_proto.ArtifactCollectorContext{}
+			}
+
+			return ordereddict.NewDict().
+				Set("ClientId", client_id).
+				Set("Hostname", services.GetHostname(client_id)).
+				Set("FlowId", flow_id).
+				Set("StartedTime", time.Unix(utils.GetInt64(row, "Timestamp"), 0)).
+				Set("State", flow.State.String()).
+				Set("Duration", flow.ExecutionDuration/1000000000).
+				Set("TotalBytes", flow.TotalUploadedBytes).
+				Set("TotalRows", flow.TotalCollectedRows)
+		}
+	}
+
+	// A unit transform.
+	return func(row *ordereddict.Dict) *ordereddict.Dict { return row }
+}
+
+// Download the table as specified by the v1/GetTable API.
+func downloadTable(config_obj *config_proto.Config) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		request := &api_proto.GetTableRequest{}
+		decoder := schema.NewDecoder()
+		decoder.SetAliasTag("json")
+		err := decoder.Decode(request, r.URL.Query())
+		if err != nil {
+			returnError(w, 404, err.Error())
+			return
+		}
+
+		rs_reader, log_path, err := getRSReader(r.Context(),
+			config_obj, request)
+		if err != nil {
+			returnError(w, 400, "Invalid request")
+			return
+		}
+		defer rs_reader.Close()
+
+		transform := getTransformer(config_obj, request)
+
+		download_name := strings.Replace(filepath.Base(log_path), "\"", "", -1)
+
+		// Log an audit event.
+		userinfo := GetUserInfo(r.Context(), config_obj)
+
+		// This should never happen!
+		if userinfo.Name == "" {
+			returnError(w, 500, "Unauthenticated access.")
+			return
+		}
+
+		switch request.DownloadFormat {
+		case "csv":
+			download_name = strings.TrimSuffix(download_name, ".json")
+			download_name += ".csv"
+
+			// From here on we already sent the headers and we can
+			// not really report an error to the client.
+			w.Header().Set("Content-Disposition", "attachment; filename="+
+				url.PathEscape(download_name))
+			w.Header().Set("Content-Type", "binary/octet-stream")
+			w.WriteHeader(200)
+
+			logger := logging.GetLogger(config_obj, &logging.Audit)
+			logger.WithFields(logrus.Fields{
+				"user":    userinfo.Name,
+				"request": request,
+				"remote":  r.RemoteAddr,
+			}).Info("DownloadTable")
+
+			scope := vql_subsystem.MakeScope()
+			csv_writer := csv.GetCSVAppender(scope, w, true /* write_headers */)
+			for row := range rs_reader.Rows(r.Context()) {
+				csv_writer.Write(
+					filterColumns(request.Columns, transform(row)))
+			}
+			csv_writer.Close()
+
+			// Output in jsonl by default.
+		default:
+			if !strings.HasSuffix(download_name, ".json") {
+				download_name += ".json"
+			}
+
+			// From here on we already sent the headers and we can
+			// not really report an error to the client.
+			w.Header().Set("Content-Disposition", "attachment; filename="+
+				url.PathEscape(download_name))
+			w.Header().Set("Content-Type", "binary/octet-stream")
+			w.WriteHeader(200)
+
+			logger := logging.GetLogger(config_obj, &logging.Audit)
+			logger.WithFields(logrus.Fields{
+				"user":    userinfo.Name,
+				"request": request,
+				"remote":  r.RemoteAddr,
+			}).Info("DownloadTable")
+
+			for row := range rs_reader.Rows(r.Context()) {
+				serialized, err := json.Marshal(
+					filterColumns(request.Columns, transform(row)))
+				if err != nil {
+					return
+				}
+
+				// Write line delimited JSON
+				_, _ = w.Write(serialized)
+				_, _ = w.Write([]byte{'\n'})
+			}
+		}
+	})
+}
+
 // URL format: /api/v1/DownloadVFSFolder
 func vfsFolderDownloadHandler(
-	config_obj *api_proto.Config) http.Handler {
+	config_obj *config_proto.Config) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		request := vfsFileDownloadRequest{}
 		decoder := schema.NewDecoder()
@@ -452,20 +346,22 @@ func vfsFolderDownloadHandler(
 			return
 		}
 
-		// From here on we already sent the headers and we can
-		// not really report an error to the client.
-		w.Header().Set("Content-Disposition", "attachment; filename="+
-			url.PathEscape(request.VfsPath+".zip"))
-		w.Header().Set("Content-Type", "binary/octet-stream")
-		w.WriteHeader(200)
-
 		// Log an audit event.
-		userinfo := logging.GetUserInfo(r.Context(), config_obj)
+		userinfo := GetUserInfo(r.Context(), config_obj)
 
 		// This should never happen!
 		if userinfo.Name == "" {
-			panic("Unauthenticated access.")
+			returnError(w, 500, "Unauthenticated access.")
+			return
 		}
+
+		// From here on we already sent the headers and we can
+		// not really report an error to the client.
+		filename := strings.Replace(request.VfsPath, "\"", "", -1)
+		w.Header().Set("Content-Disposition", "attachment; filename="+
+			url.PathEscape(filename+".zip"))
+		w.Header().Set("Content-Type", "binary/octet-stream")
+		w.WriteHeader(200)
 
 		logger := logging.GetLogger(config_obj, &logging.Audit)
 		logger.WithFields(logrus.Fields{
@@ -479,55 +375,74 @@ func vfsFolderDownloadHandler(
 		defer zip_writer.Close()
 
 		file_store_factory := file_store.GetFileStore(config_obj)
-		file_store_factory.Walk(filestorePathForVFSPath(
-			config_obj, request.ClientId, request.VfsPath),
-			func(path string, info os.FileInfo, err error) error {
-				if err != nil || info.IsDir() {
+
+		client_id := request.ClientId
+		hostname := services.GetHostname(client_id)
+		client_path_manager := paths.NewClientPathManager(client_id)
+
+		db, _ := datastore.GetDB(config_obj)
+		_ = db.Walk(config_obj, client_path_manager.VFSDownloadInfoPath(request.VfsPath),
+			func(path_name string) error {
+				download_info := &flows_proto.VFSDownloadInfo{}
+				err := db.GetSubject(config_obj, path_name, download_info)
+				if err != nil {
+					logger.Warn("Cant open %s: %v", path_name, err)
 					return nil
 				}
 
-				fd, err := file_store_factory.ReadFile(path)
+				fd, err := file_store_factory.ReadFile(download_info.VfsPath)
 				if err != nil {
-					logger.Warn("Cant open %s: %v", path, err)
+					return err
+				}
+
+				zh, err := zip_writer.Create(utils.CleanPathForZip(
+					path_name, client_id, hostname))
+				if err != nil {
+					logger.Warn("Cant create zip %s: %v", path_name, err)
 					return nil
 				}
 
-				zh, err := zip_writer.Create(path)
+				_, err = utils.Copy(r.Context(), zh, fd)
 				if err != nil {
-					logger.Warn("Cant create zip %s: %v", path, err)
+					logger.Warn("Cant copy %s", path_name)
 					return nil
 				}
 
-				_, err = io.Copy(zh, fd)
-				if err != nil {
-					logger.Warn("Cant copy %s", path)
-					return nil
-				}
 				return nil
 			})
 	})
 }
 
 func vfsGetBuffer(
-	config_obj *api_proto.Config,
+	config_obj *config_proto.Config,
 	client_id string, vfs_path string, offset uint64, length uint32) (
 	*api_proto.VFSFileBuffer, error) {
 
-	file, err := getFileForVFSPath(
-		config_obj, client_id, vfs_path)
+	file, err := file_store.GetFileStore(config_obj).ReadFile(vfs_path)
 	if err != nil {
 		return nil, err
 	}
 	defer file.Close()
 
-	file.Seek(int64(offset), 0)
+	var reader_at io.ReaderAt = &utils.ReaderAtter{Reader: file}
 
 	result := &api_proto.VFSFileBuffer{
 		Data: make([]byte, length),
 	}
 
-	n, err := io.ReadAtLeast(file, result.Data, len(result.Data))
-	if err != nil && errors.Cause(err) != io.EOF &&
+	// Try to get the index if it is there.
+	index, err := getIndex(config_obj, vfs_path)
+
+	// If the file is sparse, we use the sparse reader.
+	if err == nil && len(index.Ranges) > 0 {
+		reader_at = &utils.RangedReader{
+			ReaderAt: reader_at,
+			Index:    index,
+		}
+	}
+
+	n, err := reader_at.ReadAt(result.Data, int64(offset))
+	if err != nil && errors.Is(err, os.ErrNotExist) &&
 		errors.Cause(err) != io.ErrUnexpectedEOF {
 		return nil, err
 	}
@@ -535,4 +450,41 @@ func vfsGetBuffer(
 	result.Data = result.Data[:n]
 
 	return result, nil
+}
+
+func getIndex(config_obj *config_proto.Config,
+	vfs_path string) (*actions_proto.Index, error) {
+	index := &actions_proto.Index{}
+
+	file_store_factory := file_store.GetFileStore(config_obj)
+	fd, err := file_store_factory.ReadFile(vfs_path + ".idx")
+	if err != nil {
+		return nil, err
+	}
+	defer fd.Close()
+
+	data, err := ioutil.ReadAll(fd)
+	if err != nil {
+		return nil, err
+	}
+
+	err = json.Unmarshal(data, &index)
+	if err != nil {
+		return nil, err
+	}
+
+	return index, nil
+}
+
+func filterColumns(columns []string, row *ordereddict.Dict) *ordereddict.Dict {
+	if len(columns) == 0 {
+		return row
+	}
+
+	new_row := ordereddict.NewDict()
+	for _, column := range columns {
+		value, _ := row.Get(column)
+		new_row.Set(column, value)
+	}
+	return new_row
 }

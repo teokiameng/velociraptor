@@ -5,11 +5,10 @@ import (
 	"crypto/cipher"
 	"crypto/sha256"
 	"encoding/hex"
-	"fmt"
 	"sync"
 
 	errors "github.com/pkg/errors"
-	api_proto "www.velocidex.com/golang/velociraptor/api/proto"
+	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 )
 
 // Simple aes obfuscation. This is used in VQL obfuscation and so must
@@ -18,11 +17,10 @@ import (
 type Obfuscator struct {
 	mu      sync.Mutex
 	key     []byte
-	iv      []byte
 	crypter cipher.Block
 }
 
-func (self *Obfuscator) Encrypt(config_obj *api_proto.Config, name string) (
+func (self *Obfuscator) Encrypt(config_obj *config_proto.Config, name string) (
 	string, error) {
 	self.mu.Lock()
 	defer self.mu.Unlock()
@@ -47,8 +45,8 @@ func (self *Obfuscator) Encrypt(config_obj *api_proto.Config, name string) (
 	return "$" + hex.EncodeToString(cipher_text), nil
 }
 
-func (self *Obfuscator) generateCrypter(config_obj *api_proto.Config) error {
-	hash := sha256.Sum256([]byte(config_obj.Frontend.PrivateKey))
+func (self *Obfuscator) generateCrypter(config_obj *config_proto.Config) error {
+	hash := sha256.Sum256([]byte(config_obj.ObfuscationNonce))
 	self.key = hash[:]
 	crypter, err := aes.NewCipher(self.key)
 	if err != nil {
@@ -58,7 +56,7 @@ func (self *Obfuscator) generateCrypter(config_obj *api_proto.Config) error {
 	return nil
 }
 
-func (self *Obfuscator) Decrypt(config_obj *api_proto.Config, name string) (
+func (self *Obfuscator) Decrypt(config_obj *config_proto.Config, name string) (
 	string, error) {
 	self.mu.Lock()
 	defer self.mu.Unlock()
@@ -69,13 +67,16 @@ func (self *Obfuscator) Decrypt(config_obj *api_proto.Config, name string) (
 
 	// Not obfuscated
 	if name[0] != '$' {
-		fmt.Printf("Name %s is not obfuscated\n", name)
 		return name, nil
 	}
 
 	cipher_text, err := hex.DecodeString(name[1:])
 	if err != nil {
 		return "", err
+	}
+
+	if len(cipher_text) < 16 || len(cipher_text)%16 != 0 {
+		return "", errors.New("Cipher error")
 	}
 
 	if self.key == nil {
@@ -90,6 +91,13 @@ func (self *Obfuscator) Decrypt(config_obj *api_proto.Config, name string) (
 	mode.CryptBlocks(plain_text, cipher_text)
 
 	padding := int(plain_text[len(plain_text)-1])
+
+	// Invalid padding will occur when the crypto key has changed
+	// between the obfuscation and deobfuscation.
+	if padding < 0 || padding > 16 {
+		return "", errors.New("Padding error")
+	}
+
 	for i := len(plain_text) - padding; i < len(plain_text); i++ {
 		if int(plain_text[i]) != padding {
 			return "", errors.New("Padding error")

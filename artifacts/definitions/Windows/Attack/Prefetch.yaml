@@ -8,7 +8,7 @@ precondition: SELECT OS From info() where OS = 'windows'
 
 sources:
      - queries:
-       - SELECT Name, ModTime, Mtime.Sec AS modified
+       - SELECT Name, ModTime, Mtime AS modified
          FROM glob(globs="C:/Windows/Prefetch/*")
 
 # Reports can be MONITORING_DAILY, CLIENT, SERVER_EVENT
@@ -16,6 +16,7 @@ reports:
   - type: CLIENT
     parameters:
       - name: lookupTable
+        type: csv
         default: |
            signature,description
            attrib,Attrib Execute is usually used to modify file attributes - ATT&CK T1158
@@ -57,7 +58,7 @@ reports:
       could potentially mean.
 
       {{ define "query" }}
-         LET lookup <= SELECT * FROM parse_csv(filename=lookupTable, accessor='data')
+         LET lookup <= SELECT * FROM lookupTable
       {{ end }}
 
       {{ define "data"}}

@@ -3,6 +3,7 @@ package parsers
 import (
 	"context"
 
+	"github.com/Velocidex/ordereddict"
 	"www.velocidex.com/golang/regparser/appcompatcache"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	vfilter "www.velocidex.com/golang/vfilter"
@@ -16,8 +17,8 @@ type AppCompatCache struct{}
 
 func (self AppCompatCache) Call(
 	ctx context.Context,
-	scope *vfilter.Scope,
-	args *vfilter.Dict) <-chan vfilter.Row {
+	scope vfilter.Scope,
+	args *ordereddict.Dict) <-chan vfilter.Row {
 	output_chan := make(chan vfilter.Row)
 
 	go func() {
@@ -30,14 +31,19 @@ func (self AppCompatCache) Call(
 		}
 
 		for _, item := range appcompatcache.ParseValueData([]byte(arg.Value)) {
-			output_chan <- item
+			select {
+			case <-ctx.Done():
+				return
+
+			case output_chan <- item:
+			}
 		}
 
 	}()
 	return output_chan
 }
 
-func (self AppCompatCache) Info(scope *vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.PluginInfo {
+func (self AppCompatCache) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.PluginInfo {
 	return &vfilter.PluginInfo{
 		Name:    "appcompatcache",
 		Doc:     "Parses the appcompatcache.",

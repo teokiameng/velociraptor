@@ -19,7 +19,10 @@ package functions
 
 import (
 	"context"
+	"path/filepath"
+	"runtime"
 
+	"github.com/Velocidex/ordereddict"
 	"www.velocidex.com/golang/velociraptor/utils"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
@@ -27,13 +30,14 @@ import (
 
 type DirnameArgs struct {
 	Path string `vfilter:"required,field=path,doc=Extract directory name of path"`
+	Sep  string `vfilter:"optional,field=sep,doc=Separator to use (default /)"`
 }
 
 type DirnameFunction struct{}
 
 func (self *DirnameFunction) Call(ctx context.Context,
-	scope *vfilter.Scope,
-	args *vfilter.Dict) vfilter.Any {
+	scope vfilter.Scope,
+	args *ordereddict.Dict) vfilter.Any {
 	arg := &DirnameArgs{}
 	err := vfilter.ExtractArgs(scope, args, arg)
 	if err != nil {
@@ -41,14 +45,20 @@ func (self *DirnameFunction) Call(ctx context.Context,
 		return false
 	}
 
+	sep := arg.Sep
+	if sep == "" {
+		sep = "/"
+	}
+
 	components := utils.SplitComponents(arg.Path)
 	if len(components) > 0 {
-		return utils.JoinComponents(components[:len(components)-1], "/")
+		result := utils.JoinComponents(components[:len(components)-1], sep)
+		return result
 	}
 	return vfilter.Null{}
 }
 
-func (self DirnameFunction) Info(scope *vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
+func (self DirnameFunction) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
 		Name:    "dirname",
 		Doc:     "Return the directory path.",
@@ -59,8 +69,8 @@ func (self DirnameFunction) Info(scope *vfilter.Scope, type_map *vfilter.TypeMap
 type BasenameFunction struct{}
 
 func (self *BasenameFunction) Call(ctx context.Context,
-	scope *vfilter.Scope,
-	args *vfilter.Dict) vfilter.Any {
+	scope vfilter.Scope,
+	args *ordereddict.Dict) vfilter.Any {
 	arg := &DirnameArgs{}
 	err := vfilter.ExtractArgs(scope, args, arg)
 	if err != nil {
@@ -76,7 +86,7 @@ func (self *BasenameFunction) Call(ctx context.Context,
 	return vfilter.Null{}
 }
 
-func (self BasenameFunction) Info(scope *vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
+func (self BasenameFunction) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
 		Name:    "basename",
 		Doc:     "Return the basename of the path.",
@@ -84,7 +94,115 @@ func (self BasenameFunction) Info(scope *vfilter.Scope, type_map *vfilter.TypeMa
 	}
 }
 
+type RelnameFunctionArgs struct {
+	Path string `vfilter:"required,field=path,doc=Extract directory name of path"`
+	Base string `vfilter:"required,field=base,doc=The base of the path"`
+	Sep  string `vfilter:"optional,field=sep,doc=Separator to use (default native)"`
+}
+
+type RelnameFunction struct{}
+
+func (self *RelnameFunction) Call(ctx context.Context,
+	scope vfilter.Scope,
+	args *ordereddict.Dict) vfilter.Any {
+	arg := &RelnameFunctionArgs{}
+	err := vfilter.ExtractArgs(scope, args, arg)
+	if err != nil {
+		scope.Log("relpath: %s", err.Error())
+		return false
+	}
+
+	rel, _ := filepath.Rel(arg.Base, arg.Path)
+
+	if arg.Sep == "/" {
+		rel = filepath.ToSlash(rel)
+	}
+
+	return rel
+}
+
+func (self RelnameFunction) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
+	return &vfilter.FunctionInfo{
+		Name:    "relpath",
+		Doc:     "Return the relative path of .",
+		ArgType: type_map.AddType(scope, &RelnameFunctionArgs{}),
+	}
+}
+
+type PathJoinArgs struct {
+	Components []string `vfilter:"required,field=components,doc=Path components to join."`
+	Sep        string   `vfilter:"optional,field=sep,doc=Separator to use (default /)"`
+}
+
+type PathJoinFunction struct{}
+
+func (self *PathJoinFunction) Call(ctx context.Context,
+	scope vfilter.Scope,
+	args *ordereddict.Dict) vfilter.Any {
+	arg := &PathJoinArgs{}
+	err := vfilter.ExtractArgs(scope, args, arg)
+	if err != nil {
+		scope.Log("path_join: %s", err.Error())
+		return false
+	}
+
+	sep := arg.Sep
+	if sep == "" {
+		if runtime.GOOS == "windows" {
+			sep = "\\"
+		} else {
+			sep = "/"
+		}
+	}
+
+	var components []string
+	for _, x := range arg.Components {
+		components = append(components, utils.SplitComponents(x)...)
+	}
+
+	result := utils.JoinComponents(components, sep)
+	return result
+}
+
+func (self PathJoinFunction) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
+	return &vfilter.FunctionInfo{
+		Name:    "path_join",
+		Doc:     "Build a path by joining all components.",
+		ArgType: type_map.AddType(scope, &PathJoinArgs{}),
+	}
+}
+
+type PathSplitArgs struct {
+	Path string `vfilter:"required,field=path,doc=Path to split into components."`
+}
+
+type PathSplitFunction struct{}
+
+func (self *PathSplitFunction) Call(ctx context.Context,
+	scope vfilter.Scope,
+	args *ordereddict.Dict) vfilter.Any {
+	arg := &PathSplitArgs{}
+	err := vfilter.ExtractArgs(scope, args, arg)
+	if err != nil {
+		scope.Log("path_split: %s", err.Error())
+		return []string{}
+	}
+
+	return utils.SplitComponents(arg.Path)
+}
+
+func (self PathSplitFunction) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
+	return &vfilter.FunctionInfo{
+		Name:    "path_split",
+		Doc:     "Split a path into components. Note this is more complex than just split() because it takes into account path escaping.",
+		ArgType: type_map.AddType(scope, &PathSplitArgs{}),
+	}
+}
+
 func init() {
 	vql_subsystem.RegisterFunction(&DirnameFunction{})
 	vql_subsystem.RegisterFunction(&BasenameFunction{})
+	vql_subsystem.RegisterFunction(&RelnameFunction{})
+	vql_subsystem.RegisterFunction(&PathJoinFunction{})
+	vql_subsystem.RegisterFunction(&PathSplitFunction{})
 }

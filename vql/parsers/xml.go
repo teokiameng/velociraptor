@@ -20,6 +20,7 @@ package parsers
 import (
 	"context"
 
+	"github.com/Velocidex/ordereddict"
 	"github.com/clbanning/mxj"
 	"www.velocidex.com/golang/velociraptor/glob"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
@@ -34,8 +35,8 @@ type _ParseXMLFunction struct{}
 
 func (self _ParseXMLFunction) Call(
 	ctx context.Context,
-	scope *vfilter.Scope,
-	args *vfilter.Dict) vfilter.Any {
+	scope vfilter.Scope,
+	args *ordereddict.Dict) vfilter.Any {
 	arg := &_ParseXMLFunctionArgs{}
 	err := vfilter.ExtractArgs(scope, args, arg)
 	if err != nil {
@@ -43,7 +44,13 @@ func (self _ParseXMLFunction) Call(
 		return vfilter.Null{}
 	}
 
-	accessor, err := glob.GetAccessor(arg.Accessor, ctx)
+	err = vql_subsystem.CheckFilesystemAccess(scope, arg.Accessor)
+	if err != nil {
+		scope.Log("parse_xml: %s", err)
+		return vfilter.Null{}
+	}
+
+	accessor, err := glob.GetAccessor(arg.Accessor, scope)
 	if err != nil {
 		scope.Log("parse_xml: %v", err)
 		return vfilter.Null{}
@@ -65,7 +72,7 @@ func (self _ParseXMLFunction) Call(
 	return result.Old()
 }
 
-func (self _ParseXMLFunction) Info(scope *vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
+func (self _ParseXMLFunction) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
 		Name:    "parse_xml",
 		Doc:     "Parse an XML document into a map.",

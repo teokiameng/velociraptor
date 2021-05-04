@@ -1,14 +1,14 @@
 package api
 
 import (
-	api_proto "www.velocidex.com/golang/velociraptor/api/proto"
+	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/constants"
 	"www.velocidex.com/golang/velociraptor/datastore"
 	flows_proto "www.velocidex.com/golang/velociraptor/flows/proto"
 	"www.velocidex.com/golang/velociraptor/services"
 )
 
-func getServerMonitoringState(config_obj *api_proto.Config) (
+func getServerMonitoringState(config_obj *config_proto.Config) (
 	*flows_proto.ArtifactCollectorArgs, error) {
 	db, err := datastore.GetDB(config_obj)
 	if err != nil {
@@ -25,14 +25,14 @@ func getServerMonitoringState(config_obj *api_proto.Config) (
 }
 
 func setServerMonitoringState(
-	config_obj *api_proto.Config,
+	config_obj *config_proto.Config,
 	args *flows_proto.ArtifactCollectorArgs) error {
 	db, err := datastore.GetDB(config_obj)
 	if err != nil {
 		return err
 	}
 
-	err = services.GlobalEventTable.Update(config_obj, args)
+	err = services.GetServerEventManager().Update(config_obj, args)
 	if err != nil {
 		return err
 	}

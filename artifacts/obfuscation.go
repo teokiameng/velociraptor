@@ -3,8 +3,9 @@ package artifacts
 import (
 	"regexp"
 
+	"github.com/pkg/errors"
 	actions_proto "www.velocidex.com/golang/velociraptor/actions/proto"
-	api_proto "www.velocidex.com/golang/velociraptor/api/proto"
+	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/crypto"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
@@ -17,16 +18,16 @@ var (
 // Compile the artifact definition into a VQL Request.
 // TODO: Obfuscate let queries.
 func Obfuscate(
-	config_obj *api_proto.Config,
+	config_obj *config_proto.Config,
 	result *actions_proto.VQLCollectorArgs) error {
-	scope := vql_subsystem.MakeScope()
 	var err error
 
 	// Do not do anything if we do not compress artifacts.
-	if config_obj.Frontend.DoNotCompressArtifacts {
+	if config_obj.Frontend == nil || config_obj.Frontend.DoNotCompressArtifacts {
 		return nil
 	}
 
+	scope := vql_subsystem.MakeScope()
 	for _, query := range result.Query {
 		if query.Name != "" {
 			query.Name, err = obfuscator.Encrypt(config_obj, query.Name)
@@ -41,7 +42,7 @@ func Obfuscate(
 		// forms. This removes comments.
 		ast, err := vfilter.Parse(query.VQL)
 		if err != nil {
-			return err
+			return errors.Wrap(err, "While parsing VQL: "+query.VQL)
 		}
 
 		// TODO: Compress the AST.
@@ -51,9 +52,9 @@ func Obfuscate(
 	return nil
 }
 
-var obfuscated_item = regexp.MustCompile("\\$[a-fA-F0-9]+")
+var obfuscated_item = regexp.MustCompile(`\$[a-fA-F0-9]+`)
 
-func DeobfuscateString(config_obj *api_proto.Config, in string) string {
+func DeobfuscateString(config_obj *config_proto.Config, in string) string {
 	if config_obj.Frontend.DoNotCompressArtifacts {
 		return in
 	}
@@ -67,14 +68,22 @@ func DeobfuscateString(config_obj *api_proto.Config, in string) string {
 	})
 }
 
+func ObfuscateString(config_obj *config_proto.Config, in string) string {
+	if config_obj.Frontend.DoNotCompressArtifacts {
+		return in
+	}
+
+	out, err := obfuscator.Encrypt(config_obj, in)
+	if err != nil {
+		return in
+	}
+	return out
+}
+
 func Deobfuscate(
-	config_obj *api_proto.Config,
+	config_obj *config_proto.Config,
 	response *actions_proto.VQLResponse) error {
 	var err error
-
-	if config_obj.Frontend.DoNotCompressArtifacts {
-		return nil
-	}
 
 	response.Query.Name, err = obfuscator.Decrypt(config_obj, response.Query.Name)
 	if err != nil {

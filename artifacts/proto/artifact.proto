@@ -1,55 +1,19 @@
 syntax = "proto3";
 
-import "www.velocidex.com/golang/velociraptor/proto/semantic.proto";
+import "proto/semantic.proto";
 
 package proto;
 
-message FieldDescriptor {
-    string friendly_name = 1;
-    string name = 2;
-    bool repeated = 3;
-    string type = 4;
-    string doc = 5;
-    repeated string labels = 6;
-    string default = 7;
+option go_package = "www.velocidex.com/golang/velociraptor/artifacts/proto";
 
-    // Same as doc field.
-    string description = 8;
+message ColumnType {
+    string name = 1;
+    string type = 2;
+    string description = 3;
 }
 
-message EnumValue {
-    int32 value = 1;
-    string name = 2;
-}
-
-
-message TypeDescriptor {
-    string doc = 1;
-    // Same as doc field.
-    string description = 9;
-
-    repeated FieldDescriptor fields = 2;
-    string name = 3;
-    string friendly_name = 7;
-    string kind = 4;
-
-    // The fields are all part of a single one of structure. NOTE:
-    // Currently we only support an all or nothing approach to oneof -
-    // there can be at most a single oneof group within the proto and
-    // it implies that all the fields belong to it.
-    bool oneof = 5;
-
-    string default = 6 [(sem_type) = {
-            description: "The json encoded default value for this type."
-        }];
-
-    repeated EnumValue allowed_values = 8;
-}
-
-message Types {
-    repeated TypeDescriptor items = 1;
-}
-
+// Artifact definitions - users are able to write YAML files with
+// these defintiions.
 
 message ArtifactParameter {
     option (semantic) = {
@@ -62,6 +26,10 @@ message ArtifactParameter {
     string default = 2;
     string description = 3;
     string type = 4;
+
+    // For type = choice
+    repeated string choices = 6;
+
     string friendly_name = 5;
 }
 
@@ -86,9 +54,17 @@ message ArtifactSource {
             "this source."
         }];
 
+    string query = 6 [(sem_type) = {
+            description: "A multi-line VQL query"
+        }];
+
     repeated string queries = 2 [(sem_type) = {
             description: "Queries that will run in order. Only output from "
             "the last query will be collected."
+        }];
+
+    repeated string post_process = 5 [(sem_type) = {
+            description: "A list of queries that will be run over the results for post processing.",
         }];
 }
 
@@ -102,8 +78,13 @@ message Report {
     // Each report type will be handled differently. Read about the
     // different types in reporting.go
     string type = 1 [(sem_type) = {
-            description: "Type of report: MONITORING_DAILY, POST_PROCESSING"
+            description: "Type of report: CLIENT, SERVER"
         }];
+
+    // If specified we only allow the report to take this long.
+    uint64 timeout = 4;
+
+    string name = 5;
 
     string template = 2;
 
@@ -134,6 +115,20 @@ message Artifact {
             description: "A reference for this artifact."
         }];
 
+    repeated string required_permissions = 13 [(sem_type) = {
+            description: "A list of required permissions to collect this artifact."
+        }];
+
+    // Default resource limits.
+    Resources resources = 19;
+
+    // An optional list of tool descriptions. These are only used to
+    // initialize Velociraptor if there is no previous tool
+    // definition. It will not override existing tools. The user may
+    // override the tool name in order to control where it will be
+    // downloaded from.
+    repeated Tool tools = 15;
+
     // If set here this applies to all sources.
     string precondition = 8 [(sem_type) = {
             description: "A VQL expression to be evaluated prior to using "
@@ -155,20 +150,110 @@ message Artifact {
             description: "Where the artifact gets its data."
         }];
 
-    repeated string includes = 9 [(sem_type) = {
-            description: "A list of other artifacts to merge our source with."
+    repeated string imports = 17 [(sem_type) = {
+            description: "A list of other artifacts' export VQL to preload prior to this artifact."
         }];
+
+    string export = 18 [(sem_type) = {
+            description: "VQL that this artifact exports. It will be automatically imported into the sources section."
+        }];
+
 
     repeated Report reports = 11 [(sem_type) = {
             description: "A list of reports to potentially post process this artifact.",
         }];
 
+    // A list of column type description. These provide the GUI a hint
+    // of how to render the columns.
+    repeated ColumnType column_types = 16;
+
     /* Internal use only */
     string raw = 7 [(sem_type) = {
             description: "The raw YAML of this artifact.",
         }];
+
+    // Artifact was already compiled.
+    bool compiled = 14;
 }
 
 message ArtifactDescriptors {
     repeated Artifact items = 1;
+}
+
+
+
+// Tools are external files that Velociraptor ensures are available to
+// running artifacts.
+
+message Tool {
+    // The following are part of the tool definitions
+
+    string name = 1;
+
+    // The URL to fetch the tool from when we upload it the first
+    // time, or when we update.
+    string url = 2;
+
+    // As an alternative to a url we allow scrapping of GitHub
+    // releases using the github API. NOTE: When this method is
+    // specified, the file will always be served locally.
+    string github_project = 9;
+    string github_asset_regex = 10;
+
+    // If set, the tool will be served locally from the filestore path
+    // - otherwise the endpoint will download the file by itself from
+    // the url above.
+    bool serve_locally = 3;
+
+    // This is set when an admin explicitly overrides a tool. If this
+    // is set we will not update the tool definition when upgrading
+    // server versions.
+    bool admin_override = 7;
+
+
+    // Once the tool is added with the above fields, the following
+    // fields are used to keep state on it.
+
+    // The URL we serve the tool from when we serve locally. If this
+    // is empty we just let the endpoint download its own tool from
+    // the url above.
+    string serve_url = 8;
+
+    // Only valid for local dummy inventory.
+    string serve_path = 12;
+
+    // A filestore path where the file can be downloaded from - if
+    // served locally.
+    string filestore_path = 4;
+
+    // The name of the cached file on the endpoint. This file will
+    // persist and can be accessed again if this tool is needed in
+    // future. If the file is missing (or has the wrong hash), then it
+    // will be downloaded again.
+    string filename = 5;
+
+    // Hex encoded sha256 hash of the file. Endpoints will check this
+    // hash against their fetch file to ensure it was correctly
+    // transferred.
+    string hash = 6;
+
+    // If set on a request we refresh the hash.
+    bool materialize = 11;
+}
+
+// Keep track of all the third party tools we know about.
+message third_party {
+    repeated Tool tools = 1;
+    uint64 version = 2;
+}
+
+
+message Resources {
+    // Default timeout for this artifact
+    uint64 timeout = 1;
+    float ops_per_second = 4;
+
+    // Default resource use for the entire collection.
+    uint64 max_rows = 2;
+    uint64 max_upload_bytes = 3;
 }

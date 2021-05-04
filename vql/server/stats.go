@@ -1,10 +1,14 @@
+// +build server_vql
+
 package server
 
 import (
 	"context"
 
+	"github.com/Velocidex/ordereddict"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
+	"www.velocidex.com/golang/vfilter/functions"
 )
 
 type rateState struct {
@@ -17,9 +21,11 @@ type _RateFunctionArgs struct {
 	Y float64 `vfilter:"required,field=y,doc=The Y float"`
 }
 
-type _RateFunction struct{}
+type _RateFunction struct {
+	functions.Aggregator
+}
 
-func (self _RateFunction) Info(scope *vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
+func (self _RateFunction) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
 		Name:    "rate",
 		Doc:     "Calculates the rate (derivative) between two quantities.",
@@ -27,10 +33,10 @@ func (self _RateFunction) Info(scope *vfilter.Scope, type_map *vfilter.TypeMap) 
 	}
 }
 
-func (self *_RateFunction) Call(
+func (self _RateFunction) Call(
 	ctx context.Context,
-	scope *vfilter.Scope,
-	args *vfilter.Dict) vfilter.Any {
+	scope vfilter.Scope,
+	args *ordereddict.Dict) vfilter.Any {
 	arg := &_RateFunctionArgs{}
 	err := vfilter.ExtractArgs(scope, args, arg)
 	if err != nil {
@@ -38,18 +44,15 @@ func (self *_RateFunction) Call(
 		return vfilter.Null{}
 	}
 
-	state := &rateState{}
-	previous_value_any := scope.GetContext(vfilter.GetID(self))
-	if previous_value_any == nil {
-		scope.SetContext(
-			vfilter.GetID(self), &rateState{x: arg.X, y: arg.Y})
+	previous_value_any, pres := self.GetContext(scope)
+	if !pres {
+		self.SetContext(scope, &rateState{x: arg.X, y: arg.Y})
 		return vfilter.Null{}
 	}
 
-	state = previous_value_any.(*rateState)
+	state := previous_value_any.(*rateState)
 	value := (arg.X - state.x) / (arg.Y - state.y)
-	scope.SetContext(
-		vfilter.GetID(self), &rateState{x: arg.X, y: arg.Y})
+	self.SetContext(scope, &rateState{x: arg.X, y: arg.Y})
 
 	return value
 }
